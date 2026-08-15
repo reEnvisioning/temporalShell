@@ -25,20 +25,22 @@ use wayland_client::{
 };
 
 const DEFAULT_BORDER: u32 = 10;
-const MAX_BORDER: u32 = 256;
-const RADIUS: u32 = 16;
+const DEFAULT_CORNER_RADIUS: u32 = 16;
+const MAX_CONFIG_VALUE: u32 = 256;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Config {
     border_thickness_px: u32,
+    corner_radius_px: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             border_thickness_px: DEFAULT_BORDER,
+            corner_radius_px: DEFAULT_CORNER_RADIUS,
         }
     }
 }
@@ -87,6 +89,7 @@ fn absolute_path(name: &str, value: std::ffi::OsString) -> Result<PathBuf, Strin
 
 fn parse_config(text: &str) -> Result<Config, String> {
     let mut border = None;
+    let mut radius = None;
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -95,32 +98,45 @@ fn parse_config(text: &str) -> Result<Config, String> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("line {}: expected key = value", index + 1))?;
-        if key.trim() != "border_thickness_px" {
-            return Err(format!("line {}: unknown key", index + 1));
-        }
-        if border.is_some() {
-            return Err(format!("line {}: duplicate key", index + 1));
-        }
+        let key = key.trim();
         let value = value.trim();
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(format!(
-                "line {}: border_thickness_px must be an integer",
-                index + 1
-            ));
+            return Err(format!("line {}: {key} must be an integer", index + 1));
         }
         let value: u32 = value
             .parse()
-            .map_err(|_| format!("line {}: border_thickness_px is out of range", index + 1))?;
-        if !(1..=MAX_BORDER).contains(&value) {
-            return Err(format!(
-                "line {}: border_thickness_px must be between 1 and {MAX_BORDER}",
-                index + 1
-            ));
+            .map_err(|_| format!("line {}: {key} is out of range", index + 1))?;
+        match key {
+            "border_thickness_px" => {
+                if border.is_some() {
+                    return Err(format!("line {}: duplicate key", index + 1));
+                }
+                if !(1..=MAX_CONFIG_VALUE).contains(&value) {
+                    return Err(format!(
+                        "line {}: border_thickness_px must be between 1 and {MAX_CONFIG_VALUE}",
+                        index + 1
+                    ));
+                }
+                border = Some(value);
+            }
+            "corner_radius_px" => {
+                if radius.is_some() {
+                    return Err(format!("line {}: duplicate key", index + 1));
+                }
+                if value > MAX_CONFIG_VALUE {
+                    return Err(format!(
+                        "line {}: corner_radius_px must be between 0 and {MAX_CONFIG_VALUE}",
+                        index + 1
+                    ));
+                }
+                radius = Some(value);
+            }
+            _ => return Err(format!("line {}: unknown key", index + 1)),
         }
-        border = Some(value);
     }
     Ok(Config {
         border_thickness_px: border.unwrap_or(DEFAULT_BORDER),
+        corner_radius_px: radius.unwrap_or(DEFAULT_CORNER_RADIUS),
     })
 }
 
@@ -265,7 +281,7 @@ impl App {
             Some(output),
         );
         let border = self.config.border_thickness_px;
-        let corner_strip = border + RADIUS;
+        let corner_strip = border + self.config.corner_radius_px;
         match edge {
             Edge::Top => {
                 layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
@@ -360,6 +376,7 @@ impl App {
             pixel_height as u32,
             scale as u32,
             self.config.border_thickness_px,
+            self.config.corner_radius_px,
         );
         let layer = self.strip_mut(index).layer.clone();
         layer
@@ -551,36 +568,47 @@ fn buffer_dimensions(
     Ok((width as i32, height as i32, stride as i32, bytes))
 }
 
-fn paint(canvas: &mut [u8], edge: Edge, width: u32, height: u32, scale: u32, border: u32) {
+fn paint(
+    canvas: &mut [u8],
+    edge: Edge,
+    width: u32,
+    height: u32,
+    scale: u32,
+    border: u32,
+    radius: u32,
+) {
     for (pixel, chunk) in canvas.chunks_exact_mut(4).enumerate() {
         let x = (pixel as u32 % width) / scale;
         let y = (pixel as u32 / width) / scale;
         let color = match edge {
             Edge::Left | Edge::Right
-                if y >= border + RADIUS && y < (height / scale).saturating_sub(border + RADIUS) =>
+                if y >= border + radius && y < (height / scale).saturating_sub(border + radius) =>
             {
                 0xff00_0000
             }
             Edge::Left | Edge::Right => 0,
-            Edge::Top => top_pixel(x, y, width / scale, border),
-            Edge::Bottom => top_pixel(x, height / scale - 1 - y, width / scale, border),
+            Edge::Top => top_pixel(x, y, width / scale, border, radius),
+            Edge::Bottom => top_pixel(x, height / scale - 1 - y, width / scale, border, radius),
         };
         chunk.copy_from_slice(&color.to_le_bytes());
     }
 }
 
-fn top_pixel(x: u32, y: u32, width: u32, border: u32) -> u32 {
+fn top_pixel(x: u32, y: u32, width: u32, border: u32, radius: u32) -> u32 {
     if y < border {
         return 0xff00_0000;
     }
-    let corner_strip = border + RADIUS;
+    if radius == 0 {
+        return 0;
+    }
+    let corner_strip = border + radius;
     if x >= corner_strip && x < width.saturating_sub(corner_strip) {
         return 0;
     }
     let corner_x = if x < corner_strip { x } else { width - 1 - x } as i64;
     let dx = corner_x - i64::from(corner_strip);
     let dy = i64::from(y) - i64::from(corner_strip);
-    if dx * dx + dy * dy <= i64::from(RADIUS).pow(2) {
+    if dx * dx + dy * dy <= i64::from(radius).pow(2) {
         0
     } else {
         0xff00_0000
@@ -605,19 +633,24 @@ mod tests {
 
     #[test]
     fn config_is_strict_and_defaults() {
-        assert_eq!(parse_config("").unwrap().border_thickness_px, 10);
+        assert_eq!(parse_config("").unwrap(), Config::default());
         assert_eq!(
-            parse_config("# border\nborder_thickness_px = 24\n")
-                .unwrap()
-                .border_thickness_px,
-            24
+            parse_config("# border\nborder_thickness_px = 24\ncorner_radius_px = 8\n").unwrap(),
+            Config {
+                border_thickness_px: 24,
+                corner_radius_px: 8,
+            }
         );
         for invalid in [
             "border_thickness_px = nope",
+            "border_thickness_px = -1",
             "border_thickness_px = 0",
             "border_thickness_px = 257",
+            "corner_radius_px = -1",
+            "corner_radius_px = 257",
             "unknown = 10",
             "border_thickness_px = 10\nborder_thickness_px = 11",
+            "corner_radius_px = 10\ncorner_radius_px = 11",
             "border_thickness_px 10",
         ] {
             assert!(parse_config(invalid).is_err(), "accepted {invalid:?}");
@@ -626,17 +659,24 @@ mod tests {
 
     #[test]
     fn border_geometry_matches_the_reference() {
-        let corner_strip = DEFAULT_BORDER + RADIUS;
-        assert_eq!(top_pixel(100, 0, 200, 10), 0xff00_0000);
-        assert_eq!(top_pixel(100, 9, 200, 10), 0xff00_0000);
-        assert_eq!(top_pixel(100, 10, 200, 10), 0);
-        assert_eq!(top_pixel(100, 25, 200, 10), 0);
-        assert_eq!(top_pixel(10, 25, 200, 10), 0xff00_0000);
-        assert_eq!(top_pixel(11, 25, 200, 10), 0);
+        let corner_strip = DEFAULT_BORDER + DEFAULT_CORNER_RADIUS;
+        assert_eq!(top_pixel(100, 0, 200, 10, 16), 0xff00_0000);
+        assert_eq!(top_pixel(100, 9, 200, 10, 16), 0xff00_0000);
+        assert_eq!(top_pixel(100, 10, 200, 10, 16), 0);
+        assert_eq!(top_pixel(100, 25, 200, 10, 16), 0);
+        assert_eq!(top_pixel(10, 25, 200, 10, 16), 0xff00_0000);
+        assert_eq!(top_pixel(11, 25, 200, 10, 16), 0);
         for y in 0..corner_strip {
-            assert_eq!(top_pixel(0, y, 200, 10), top_pixel(199, y, 200, 10));
+            assert_eq!(top_pixel(0, y, 200, 10, 16), top_pixel(199, y, 200, 10, 16));
         }
-        assert_eq!(top_pixel(0, 20, 8, 10), top_pixel(7, 20, 8, 10));
+        assert_eq!(top_pixel(0, 20, 8, 10, 16), top_pixel(7, 20, 8, 10, 16));
+    }
+
+    #[test]
+    fn non_default_radius_changes_geometry() {
+        assert_eq!(top_pixel(10, 18, 200, 10, 8), 0);
+        assert_eq!(top_pixel(10, 18, 200, 10, 16), 0xff00_0000);
+        assert_eq!(top_pixel(0, 10, 200, 10, 0), 0);
     }
 
     #[test]
@@ -644,9 +684,9 @@ mod tests {
         let mut top = [0_u8; 52 * 26 * 4];
         let mut bottom = top;
         let mut side = [0_u8; 10 * 26 * 4];
-        paint(&mut top, Edge::Top, 52, 26, 1, 10);
-        paint(&mut bottom, Edge::Bottom, 52, 26, 1, 10);
-        paint(&mut side, Edge::Left, 10, 26, 1, 10);
+        paint(&mut top, Edge::Top, 52, 26, 1, 10, 16);
+        paint(&mut bottom, Edge::Bottom, 52, 26, 1, 10, 16);
+        paint(&mut side, Edge::Left, 10, 26, 1, 10, 16);
         for y in 0..26 {
             for x in 0..52 {
                 assert_eq!(
@@ -659,7 +699,7 @@ mod tests {
             .chunks_exact(4)
             .all(|pixel| pixel == 0_u32.to_le_bytes()));
         let mut tall_side = [0_u8; 10 * 60 * 4];
-        paint(&mut tall_side, Edge::Left, 10, 60, 1, 10);
+        paint(&mut tall_side, Edge::Left, 10, 60, 1, 10, 16);
         assert_eq!(&tall_side[..4], &0_u32.to_le_bytes());
         assert_eq!(
             &tall_side[(30 * 10 * 4)..][..4],
@@ -671,8 +711,8 @@ mod tests {
     fn integer_scale_is_logically_equivalent() {
         let mut one = [0_u8; 52 * 26 * 4];
         let mut two = [0_u8; 104 * 52 * 4];
-        paint(&mut one, Edge::Top, 52, 26, 1, 10);
-        paint(&mut two, Edge::Top, 104, 52, 2, 10);
+        paint(&mut one, Edge::Top, 52, 26, 1, 10, 16);
+        paint(&mut two, Edge::Top, 104, 52, 2, 10, 16);
         for y in 0..26 {
             for x in 0..52 {
                 assert_eq!(

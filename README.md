@@ -27,6 +27,8 @@ temporalShell available
 
 ```toml
 border_thickness_px = 10
+corner_radius_px = 16
 ```
 
+`border_thickness_px` is 1–256 (default 10); `corner_radius_px` is 0–256 (default 16).
 Requires a Wayland compositor advertising `wlr-layer-shell`; no X11 support.
