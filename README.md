@@ -31,4 +31,5 @@ corner_radius_px = 16
 ```
 
 `border_thickness_px` is 1–256 (default 10); `corner_radius_px` is 0–256 (default 16).
+The sharp opaque border has a fixed 3 px inward black shadow (30% → 20% → 10% alpha), which scales with integer buffer scale and is intentionally not configurable.
 Requires a Wayland compositor advertising `wlr-layer-shell`; no X11 support.

@@ -26,6 +26,8 @@ use wayland_client::{
 
 const DEFAULT_BORDER: u32 = 10;
 const DEFAULT_CORNER_RADIUS: u32 = 16;
+const SHADOW_WIDTH: u32 = 3;
+const SHADOW: [u32; SHADOW_WIDTH as usize] = [0x4d00_0000, 0x3300_0000, 0x1a00_0000];
 const MAX_CONFIG_VALUE: u32 = 256;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
@@ -281,7 +283,7 @@ impl App {
             Some(output),
         );
         let border = self.config.border_thickness_px;
-        let corner_strip = border + self.config.corner_radius_px;
+        let corner_strip = border + self.config.corner_radius_px + SHADOW_WIDTH;
         match edge {
             Edge::Top => {
                 layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
@@ -293,11 +295,11 @@ impl App {
             }
             Edge::Left => {
                 layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT);
-                layer.set_size(border, 0);
+                layer.set_size(border + SHADOW_WIDTH, 0);
             }
             Edge::Right => {
                 layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::RIGHT);
-                layer.set_size(border, 0);
+                layer.set_size(border + SHADOW_WIDTH, 0);
             }
         }
         layer.set_exclusive_zone(0);
@@ -581,16 +583,42 @@ fn paint(
         let x = (pixel as u32 % width) / scale;
         let y = (pixel as u32 / width) / scale;
         let color = match edge {
-            Edge::Left | Edge::Right
-                if y >= border + radius && y < (height / scale).saturating_sub(border + radius) =>
-            {
-                0xff00_0000
+            Edge::Left | Edge::Right => {
+                side_pixel(x, y, width / scale, height / scale, edge, border, radius)
             }
-            Edge::Left | Edge::Right => 0,
             Edge::Top => top_pixel(x, y, width / scale, border, radius),
             Edge::Bottom => top_pixel(x, height / scale - 1 - y, width / scale, border, radius),
         };
         chunk.copy_from_slice(&color.to_le_bytes());
+    }
+}
+
+fn shadow(distance: u32) -> u32 {
+    SHADOW.get(distance as usize).copied().unwrap_or(0)
+}
+
+fn side_pixel(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    edge: Edge,
+    border: u32,
+    radius: u32,
+) -> u32 {
+    let corner_extent = border + radius + SHADOW_WIDTH;
+    if y < corner_extent || y >= height.saturating_sub(corner_extent) {
+        return 0;
+    }
+    let x = match edge {
+        Edge::Left => x,
+        Edge::Right => width - 1 - x,
+        Edge::Top | Edge::Bottom => unreachable!(),
+    };
+    if x < border {
+        0xff00_0000
+    } else {
+        shadow(x - border)
     }
 }
 
@@ -599,20 +627,25 @@ fn top_pixel(x: u32, y: u32, width: u32, border: u32, radius: u32) -> u32 {
         return 0xff00_0000;
     }
     if radius == 0 {
-        return 0;
+        return shadow(y - border);
     }
     let corner_strip = border + radius;
     if x >= corner_strip && x < width.saturating_sub(corner_strip) {
-        return 0;
+        return shadow(y - border);
     }
     let corner_x = if x < corner_strip { x } else { width - 1 - x } as i64;
     let dx = corner_x - i64::from(corner_strip);
     let dy = i64::from(y) - i64::from(corner_strip);
-    if dx * dx + dy * dy <= i64::from(radius).pow(2) {
-        0
-    } else {
-        0xff00_0000
+    let distance_squared = dx * dx + dy * dy;
+    if distance_squared > i64::from(radius).pow(2) {
+        return 0xff00_0000;
     }
+    for distance in 0..SHADOW_WIDTH {
+        if distance_squared > i64::from(radius.saturating_sub(distance + 1)).pow(2) {
+            return shadow(distance);
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -649,6 +682,7 @@ mod tests {
             "corner_radius_px = -1",
             "corner_radius_px = 257",
             "unknown = 10",
+            "shadow_strength = 30",
             "border_thickness_px = 10\nborder_thickness_px = 11",
             "corner_radius_px = 10\ncorner_radius_px = 11",
             "border_thickness_px 10",
@@ -657,68 +691,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn border_geometry_matches_the_reference() {
-        let corner_strip = DEFAULT_BORDER + DEFAULT_CORNER_RADIUS;
-        assert_eq!(top_pixel(100, 0, 200, 10, 16), 0xff00_0000);
-        assert_eq!(top_pixel(100, 9, 200, 10, 16), 0xff00_0000);
-        assert_eq!(top_pixel(100, 10, 200, 10, 16), 0);
-        assert_eq!(top_pixel(100, 25, 200, 10, 16), 0);
-        assert_eq!(top_pixel(10, 25, 200, 10, 16), 0xff00_0000);
-        assert_eq!(top_pixel(11, 25, 200, 10, 16), 0);
-        for y in 0..corner_strip {
-            assert_eq!(top_pixel(0, y, 200, 10, 16), top_pixel(199, y, 200, 10, 16));
-        }
-        assert_eq!(top_pixel(0, 20, 8, 10, 16), top_pixel(7, 20, 8, 10, 16));
+    fn pixel(canvas: &[u8], width: u32, x: u32, y: u32) -> u32 {
+        let start = ((y * width + x) * 4) as usize;
+        u32::from_le_bytes(canvas[start..start + 4].try_into().unwrap())
     }
 
     #[test]
-    fn non_default_radius_changes_geometry() {
-        assert_eq!(top_pixel(10, 18, 200, 10, 8), 0);
-        assert_eq!(top_pixel(10, 18, 200, 10, 16), 0xff00_0000);
-        assert_eq!(top_pixel(0, 10, 200, 10, 0), 0);
+    fn shadow_keeps_border_sharp_and_fades_inward() {
+        let mut top = vec![0; 80 * 29 * 4];
+        paint(&mut top, Edge::Top, 80, 29, 1, 10, 16);
+        assert_eq!(pixel(&top, 80, 40, 9), 0xff00_0000);
+        assert_eq!(pixel(&top, 80, 40, 10), 0x4d00_0000);
+        assert_eq!(pixel(&top, 80, 40, 11), 0x3300_0000);
+        assert_eq!(pixel(&top, 80, 40, 12), 0x1a00_0000);
+        assert_eq!(pixel(&top, 80, 40, 13), 0);
     }
 
     #[test]
-    fn sides_and_bottom_are_black_and_mirrored() {
-        let mut top = [0_u8; 52 * 26 * 4];
-        let mut bottom = top;
-        let mut side = [0_u8; 10 * 26 * 4];
-        paint(&mut top, Edge::Top, 52, 26, 1, 10, 16);
-        paint(&mut bottom, Edge::Bottom, 52, 26, 1, 10, 16);
-        paint(&mut side, Edge::Left, 10, 26, 1, 10, 16);
-        for y in 0..26 {
-            for x in 0..52 {
-                assert_eq!(
-                    &top[((y * 52 + x) * 4) as usize..][..4],
-                    &bottom[(((25 - y) * 52 + x) * 4) as usize..][..4]
-                );
+    fn shadow_geometry_is_mirrored_and_scaled() {
+        let mut top = vec![0; 80 * 29 * 4];
+        let mut bottom = vec![0; 80 * 29 * 4];
+        let mut left = vec![0; 13 * 80 * 4];
+        let mut right = vec![0; 13 * 80 * 4];
+        paint(&mut top, Edge::Top, 80, 29, 1, 10, 16);
+        paint(&mut bottom, Edge::Bottom, 80, 29, 1, 10, 16);
+        paint(&mut left, Edge::Left, 13, 80, 1, 10, 16);
+        paint(&mut right, Edge::Right, 13, 80, 1, 10, 16);
+        for y in 0..29 {
+            for x in 0..80 {
+                assert_eq!(pixel(&top, 80, x, y), pixel(&top, 80, 79 - x, y));
+                assert_eq!(pixel(&top, 80, x, y), pixel(&bottom, 80, x, 28 - y));
             }
         }
-        assert!(side
-            .chunks_exact(4)
-            .all(|pixel| pixel == 0_u32.to_le_bytes()));
-        let mut tall_side = [0_u8; 10 * 60 * 4];
-        paint(&mut tall_side, Edge::Left, 10, 60, 1, 10, 16);
-        assert_eq!(&tall_side[..4], &0_u32.to_le_bytes());
-        assert_eq!(
-            &tall_side[(30 * 10 * 4)..][..4],
-            &0xff00_0000_u32.to_le_bytes()
-        );
-    }
+        assert_eq!(pixel(&left, 13, 0, 28), 0);
+        assert_eq!(pixel(&left, 13, 0, 29), 0xff00_0000);
+        assert_eq!(pixel(&left, 13, 10, 29), 0x4d00_0000);
+        assert_eq!(pixel(&left, 13, 12, 29), 0x1a00_0000);
+        assert_eq!(pixel(&left, 13, 0, 51), 0);
+        for y in 0..80 {
+            for x in 0..13 {
+                assert_eq!(pixel(&left, 13, x, y), pixel(&right, 13, 12 - x, y));
+            }
+        }
 
-    #[test]
-    fn integer_scale_is_logically_equivalent() {
-        let mut one = [0_u8; 52 * 26 * 4];
-        let mut two = [0_u8; 104 * 52 * 4];
-        paint(&mut one, Edge::Top, 52, 26, 1, 10, 16);
-        paint(&mut two, Edge::Top, 104, 52, 2, 10, 16);
-        for y in 0..26 {
-            for x in 0..52 {
-                assert_eq!(
-                    &one[((y * 52 + x) * 4) as usize..][..4],
-                    &two[(((y * 2 * 104) + x * 2) * 4) as usize..][..4]
-                );
+        let mut radius_zero = vec![0; 20 * 13 * 4];
+        paint(&mut radius_zero, Edge::Top, 20, 13, 1, 10, 0);
+        assert_eq!(pixel(&radius_zero, 20, 0, 10), 0x4d00_0000);
+        assert_eq!(pixel(&radius_zero, 20, 0, 12), 0x1a00_0000);
+
+        let mut scaled = vec![0; 160 * 58 * 4];
+        paint(&mut scaled, Edge::Top, 160, 58, 2, 10, 16);
+        for y in 0..29 {
+            for x in 0..80 {
+                let expected = pixel(&top, 80, x, y);
+                assert_eq!(pixel(&scaled, 160, x * 2, y * 2), expected);
+                assert_eq!(pixel(&scaled, 160, x * 2 + 1, y * 2 + 1), expected);
             }
         }
     }
@@ -728,5 +755,6 @@ mod tests {
         assert!(buffer_dimensions(0, 16, 1).is_err());
         assert!(buffer_dimensions(u32::MAX, 16, 1).is_err());
         assert!(buffer_dimensions(16, 16, 0).is_err());
+        assert!(buffer_dimensions(4096, 4097, 1).is_err());
     }
 }
