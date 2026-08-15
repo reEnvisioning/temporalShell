@@ -10,6 +10,7 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "Capability-based Wayland border";
     license = lib.licenses.mit;
+    homepage = "https://github.com/reEnvisioning/temporalShell";
     mainProgram = "temporalShell";
   };
 }
