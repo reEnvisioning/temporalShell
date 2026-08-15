@@ -556,7 +556,12 @@ fn paint(canvas: &mut [u8], edge: Edge, width: u32, height: u32, scale: u32, bor
         let x = (pixel as u32 % width) / scale;
         let y = (pixel as u32 / width) / scale;
         let color = match edge {
-            Edge::Left | Edge::Right => 0xff00_0000,
+            Edge::Left | Edge::Right
+                if y >= border + RADIUS && y < (height / scale).saturating_sub(border + RADIUS) =>
+            {
+                0xff00_0000
+            }
+            Edge::Left | Edge::Right => 0,
             Edge::Top => top_pixel(x, y, width / scale, border),
             Edge::Bottom => top_pixel(x, height / scale - 1 - y, width / scale, border),
         };
@@ -652,7 +657,14 @@ mod tests {
         }
         assert!(side
             .chunks_exact(4)
-            .all(|pixel| pixel == 0xff00_0000_u32.to_le_bytes()));
+            .all(|pixel| pixel == 0_u32.to_le_bytes()));
+        let mut tall_side = [0_u8; 10 * 60 * 4];
+        paint(&mut tall_side, Edge::Left, 10, 60, 1, 10);
+        assert_eq!(&tall_side[..4], &0_u32.to_le_bytes());
+        assert_eq!(
+            &tall_side[(30 * 10 * 4)..][..4],
+            &0xff00_0000_u32.to_le_bytes()
+        );
     }
 
     #[test]
