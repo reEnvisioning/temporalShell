@@ -1,0 +1,14 @@
+[package]
+name = "temporalshell"
+version = "0.1.0"
+edition = "2021"
+description = "Capability-based Wayland border"
+license = "MIT"
+
+[[bin]]
+name = "temporalShell"
+path = "src/main.rs"
+
+[dependencies]
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-client = "0.31"
