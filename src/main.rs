@@ -26,8 +26,10 @@ use wayland_client::{
 
 const DEFAULT_BORDER: u32 = 10;
 const DEFAULT_CORNER_RADIUS: u32 = 16;
+const DEFAULT_SHADOW_STRENGTH_PERCENT: u32 = 100;
+const DEFAULT_SHADOW_COLOR: u32 = 0x000000;
 const SHADOW_WIDTH: u32 = 3;
-const SHADOW: [u32; SHADOW_WIDTH as usize] = [0x4d00_0000, 0x3300_0000, 0x1a00_0000];
+const SHADOW: [u32; SHADOW_WIDTH as usize] = [0x4d, 0x33, 0x1a];
 const MAX_CONFIG_VALUE: u32 = 256;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
@@ -36,6 +38,8 @@ const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 struct Config {
     border_thickness_px: u32,
     corner_radius_px: u32,
+    shadow_strength_percent: u32,
+    shadow_color: u32,
 }
 
 impl Default for Config {
@@ -43,6 +47,8 @@ impl Default for Config {
         Self {
             border_thickness_px: DEFAULT_BORDER,
             corner_radius_px: DEFAULT_CORNER_RADIUS,
+            shadow_strength_percent: DEFAULT_SHADOW_STRENGTH_PERCENT,
+            shadow_color: DEFAULT_SHADOW_COLOR,
         }
     }
 }
@@ -92,6 +98,8 @@ fn absolute_path(name: &str, value: std::ffi::OsString) -> Result<PathBuf, Strin
 fn parse_config(text: &str) -> Result<Config, String> {
     let mut border = None;
     let mut radius = None;
+    let mut shadow_strength = None;
+    let mut shadow_color = None;
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -102,36 +110,73 @@ fn parse_config(text: &str) -> Result<Config, String> {
             .ok_or_else(|| format!("line {}: expected key = value", index + 1))?;
         let key = key.trim();
         let value = value.trim();
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(format!("line {}: {key} must be an integer", index + 1));
-        }
-        let value: u32 = value
-            .parse()
-            .map_err(|_| format!("line {}: {key} is out of range", index + 1))?;
         match key {
-            "border_thickness_px" => {
-                if border.is_some() {
+            "shadow_color" => {
+                if shadow_color.is_some() {
                     return Err(format!("line {}: duplicate key", index + 1));
                 }
-                if !(1..=MAX_CONFIG_VALUE).contains(&value) {
-                    return Err(format!(
+                let color = value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .filter(|value| {
+                        value.len() == 7
+                            && value.starts_with('#')
+                            && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .ok_or_else(|| {
+                        format!("line {}: shadow_color must be quoted #RRGGBB", index + 1)
+                    })?;
+                shadow_color = Some(
+                    u32::from_str_radix(&color[1..], 16)
+                        .map_err(|_| format!("line {}: shadow_color is invalid", index + 1))?,
+                );
+            }
+            "border_thickness_px" | "corner_radius_px" | "shadow_strength_percent" => {
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(format!("line {}: {key} must be an integer", index + 1));
+                }
+                let value: u32 = value
+                    .parse()
+                    .map_err(|_| format!("line {}: {key} is out of range", index + 1))?;
+                match key {
+                    "border_thickness_px" => {
+                        if border.is_some() {
+                            return Err(format!("line {}: duplicate key", index + 1));
+                        }
+                        if !(1..=MAX_CONFIG_VALUE).contains(&value) {
+                            return Err(format!(
                         "line {}: border_thickness_px must be between 1 and {MAX_CONFIG_VALUE}",
                         index + 1
                     ));
-                }
-                border = Some(value);
-            }
-            "corner_radius_px" => {
-                if radius.is_some() {
-                    return Err(format!("line {}: duplicate key", index + 1));
-                }
-                if value > MAX_CONFIG_VALUE {
-                    return Err(format!(
+                        }
+                        border = Some(value);
+                    }
+                    "corner_radius_px" => {
+                        if radius.is_some() {
+                            return Err(format!("line {}: duplicate key", index + 1));
+                        }
+                        if value > MAX_CONFIG_VALUE {
+                            return Err(format!(
                         "line {}: corner_radius_px must be between 0 and {MAX_CONFIG_VALUE}",
                         index + 1
                     ));
+                        }
+                        radius = Some(value);
+                    }
+                    "shadow_strength_percent" => {
+                        if shadow_strength.is_some() {
+                            return Err(format!("line {}: duplicate key", index + 1));
+                        }
+                        if value > 100 {
+                            return Err(format!(
+                                "line {}: shadow_strength_percent must be between 0 and 100",
+                                index + 1
+                            ));
+                        }
+                        shadow_strength = Some(value);
+                    }
+                    _ => unreachable!(),
                 }
-                radius = Some(value);
             }
             _ => return Err(format!("line {}: unknown key", index + 1)),
         }
@@ -139,6 +184,8 @@ fn parse_config(text: &str) -> Result<Config, String> {
     Ok(Config {
         border_thickness_px: border.unwrap_or(DEFAULT_BORDER),
         corner_radius_px: radius.unwrap_or(DEFAULT_CORNER_RADIUS),
+        shadow_strength_percent: shadow_strength.unwrap_or(DEFAULT_SHADOW_STRENGTH_PERCENT),
+        shadow_color: shadow_color.unwrap_or(DEFAULT_SHADOW_COLOR),
     })
 }
 
@@ -377,8 +424,7 @@ impl App {
             pixel_width as u32,
             pixel_height as u32,
             scale as u32,
-            self.config.border_thickness_px,
-            self.config.corner_radius_px,
+            self.config,
         );
         let layer = self.strip_mut(index).layer.clone();
         layer
@@ -570,43 +616,34 @@ fn buffer_dimensions(
     Ok((width as i32, height as i32, stride as i32, bytes))
 }
 
-fn paint(
-    canvas: &mut [u8],
-    edge: Edge,
-    width: u32,
-    height: u32,
-    scale: u32,
-    border: u32,
-    radius: u32,
-) {
+fn paint(canvas: &mut [u8], edge: Edge, width: u32, height: u32, scale: u32, config: Config) {
     for (pixel, chunk) in canvas.chunks_exact_mut(4).enumerate() {
         let x = (pixel as u32 % width) / scale;
         let y = (pixel as u32 / width) / scale;
         let color = match edge {
             Edge::Left | Edge::Right => {
-                side_pixel(x, y, width / scale, height / scale, edge, border, radius)
+                side_pixel(x, y, width / scale, height / scale, edge, config)
             }
-            Edge::Top => top_pixel(x, y, width / scale, border, radius),
-            Edge::Bottom => top_pixel(x, height / scale - 1 - y, width / scale, border, radius),
+            Edge::Top => top_pixel(x, y, width / scale, config),
+            Edge::Bottom => top_pixel(x, height / scale - 1 - y, width / scale, config),
         };
         chunk.copy_from_slice(&color.to_le_bytes());
     }
 }
 
-fn shadow(distance: u32) -> u32 {
-    SHADOW.get(distance as usize).copied().unwrap_or(0)
+fn shadow(distance: u32, strength: u32, color: u32) -> u32 {
+    let Some(&alpha) = SHADOW.get(distance as usize) else {
+        return 0;
+    };
+    let alpha = (alpha * strength + 50) / 100;
+    let red = ((color >> 16) * alpha + 127) / 255;
+    let green = (((color >> 8) & 0xff) * alpha + 127) / 255;
+    let blue = ((color & 0xff) * alpha + 127) / 255;
+    alpha << 24 | red << 16 | green << 8 | blue
 }
 
-fn side_pixel(
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    edge: Edge,
-    border: u32,
-    radius: u32,
-) -> u32 {
-    let corner_extent = border + radius + SHADOW_WIDTH;
+fn side_pixel(x: u32, y: u32, width: u32, height: u32, edge: Edge, config: Config) -> u32 {
+    let corner_extent = config.border_thickness_px + config.corner_radius_px + SHADOW_WIDTH;
     if y < corner_extent || y >= height.saturating_sub(corner_extent) {
         return 0;
     }
@@ -615,34 +652,51 @@ fn side_pixel(
         Edge::Right => width - 1 - x,
         Edge::Top | Edge::Bottom => unreachable!(),
     };
-    if x < border {
+    if x < config.border_thickness_px {
         0xff00_0000
     } else {
-        shadow(x - border)
+        shadow(
+            x - config.border_thickness_px,
+            config.shadow_strength_percent,
+            config.shadow_color,
+        )
     }
 }
 
-fn top_pixel(x: u32, y: u32, width: u32, border: u32, radius: u32) -> u32 {
-    if y < border {
+fn top_pixel(x: u32, y: u32, width: u32, config: Config) -> u32 {
+    if y < config.border_thickness_px {
         return 0xff00_0000;
     }
-    if radius == 0 {
-        return shadow(y - border);
+    if config.corner_radius_px == 0 {
+        return shadow(
+            y - config.border_thickness_px,
+            config.shadow_strength_percent,
+            config.shadow_color,
+        );
     }
-    let corner_strip = border + radius;
+    let corner_strip = config.border_thickness_px + config.corner_radius_px;
     if x >= corner_strip && x < width.saturating_sub(corner_strip) {
-        return shadow(y - border);
+        return shadow(
+            y - config.border_thickness_px,
+            config.shadow_strength_percent,
+            config.shadow_color,
+        );
     }
     let corner_x = if x < corner_strip { x } else { width - 1 - x } as i64;
     let dx = corner_x - i64::from(corner_strip);
     let dy = i64::from(y) - i64::from(corner_strip);
     let distance_squared = dx * dx + dy * dy;
-    if distance_squared > i64::from(radius).pow(2) {
+    if distance_squared > i64::from(config.corner_radius_px).pow(2) {
         return 0xff00_0000;
     }
     for distance in 0..SHADOW_WIDTH {
-        if distance_squared > i64::from(radius.saturating_sub(distance + 1)).pow(2) {
-            return shadow(distance);
+        if distance_squared > i64::from(config.corner_radius_px.saturating_sub(distance + 1)).pow(2)
+        {
+            return shadow(
+                distance,
+                config.shadow_strength_percent,
+                config.shadow_color,
+            );
         }
     }
     0
@@ -668,10 +722,22 @@ mod tests {
     fn config_is_strict_and_defaults() {
         assert_eq!(parse_config("").unwrap(), Config::default());
         assert_eq!(
-            parse_config("# border\nborder_thickness_px = 24\ncorner_radius_px = 8\n").unwrap(),
+            parse_config(
+                "# border\nborder_thickness_px = 24\ncorner_radius_px = 8\nshadow_strength_percent = 0\nshadow_color = \"#a1B2c3\"\n"
+            )
+            .unwrap(),
             Config {
                 border_thickness_px: 24,
                 corner_radius_px: 8,
+                shadow_strength_percent: 0,
+                shadow_color: 0xa1b2c3,
+            }
+        );
+        assert_eq!(
+            parse_config("shadow_strength_percent = 100\nshadow_color = \"#ABCDEF\"").unwrap(),
+            Config {
+                shadow_color: 0xabcdef,
+                ..Config::default()
             }
         );
         for invalid in [
@@ -681,10 +747,22 @@ mod tests {
             "border_thickness_px = 257",
             "corner_radius_px = -1",
             "corner_radius_px = 257",
+            "shadow_strength_percent = -1",
+            "shadow_strength_percent = 101",
+            "shadow_strength_percent = 1.0",
+            "shadow_color = #000000",
+            "shadow_color = \"000000\"",
+            "shadow_color = \"#00000\"",
+            "shadow_color = \"#00000g\"",
+            "shadow_color = \"#000\"",
+            "shadow_color = \"#00000000\"",
+            "shadow_color = \"#000000\" trailing",
             "unknown = 10",
             "shadow_strength = 30",
             "border_thickness_px = 10\nborder_thickness_px = 11",
             "corner_radius_px = 10\ncorner_radius_px = 11",
+            "shadow_strength_percent = 10\nshadow_strength_percent = 11",
+            "shadow_color = \"#000000\"\nshadow_color = \"#ffffff\"",
             "border_thickness_px 10",
         ] {
             assert!(parse_config(invalid).is_err(), "accepted {invalid:?}");
@@ -697,26 +775,42 @@ mod tests {
     }
 
     #[test]
-    fn shadow_keeps_border_sharp_and_fades_inward() {
-        let mut top = vec![0; 80 * 29 * 4];
-        paint(&mut top, Edge::Top, 80, 29, 1, 10, 16);
-        assert_eq!(pixel(&top, 80, 40, 9), 0xff00_0000);
-        assert_eq!(pixel(&top, 80, 40, 10), 0x4d00_0000);
-        assert_eq!(pixel(&top, 80, 40, 11), 0x3300_0000);
-        assert_eq!(pixel(&top, 80, 40, 12), 0x1a00_0000);
-        assert_eq!(pixel(&top, 80, 40, 13), 0);
+    fn shadow_strength_and_color_are_premultiplied() {
+        assert_eq!(shadow(0, 100, 0), 0x4d00_0000);
+        assert_eq!(shadow(1, 100, 0), 0x3300_0000);
+        assert_eq!(shadow(2, 100, 0), 0x1a00_0000);
+        assert_eq!(shadow(0, 50, 0), 0x2700_0000);
+        assert_eq!(shadow(1, 50, 0), 0x1a00_0000);
+        assert_eq!(shadow(2, 50, 0), 0x0d00_0000);
+        assert_eq!(shadow(0, 100, 0xff0000), 0x4d4d_0000);
+        assert_eq!(shadow(0, 100, 0xffffff), 0x4d4d_4d4d);
+        assert_eq!(shadow(0, 0, 0xffffff), 0);
+        assert_eq!(
+            top_pixel(
+                40,
+                9,
+                80,
+                Config {
+                    shadow_strength_percent: 0,
+                    shadow_color: 0xffffff,
+                    ..Config::default()
+                },
+            ),
+            0xff00_0000
+        );
     }
 
     #[test]
     fn shadow_geometry_is_mirrored_and_scaled() {
+        let config = Config::default();
         let mut top = vec![0; 80 * 29 * 4];
         let mut bottom = vec![0; 80 * 29 * 4];
         let mut left = vec![0; 13 * 80 * 4];
         let mut right = vec![0; 13 * 80 * 4];
-        paint(&mut top, Edge::Top, 80, 29, 1, 10, 16);
-        paint(&mut bottom, Edge::Bottom, 80, 29, 1, 10, 16);
-        paint(&mut left, Edge::Left, 13, 80, 1, 10, 16);
-        paint(&mut right, Edge::Right, 13, 80, 1, 10, 16);
+        paint(&mut top, Edge::Top, 80, 29, 1, config);
+        paint(&mut bottom, Edge::Bottom, 80, 29, 1, config);
+        paint(&mut left, Edge::Left, 13, 80, 1, config);
+        paint(&mut right, Edge::Right, 13, 80, 1, config);
         for y in 0..29 {
             for x in 0..80 {
                 assert_eq!(pixel(&top, 80, x, y), pixel(&top, 80, 79 - x, y));
@@ -735,12 +829,22 @@ mod tests {
         }
 
         let mut radius_zero = vec![0; 20 * 13 * 4];
-        paint(&mut radius_zero, Edge::Top, 20, 13, 1, 10, 0);
+        paint(
+            &mut radius_zero,
+            Edge::Top,
+            20,
+            13,
+            1,
+            Config {
+                corner_radius_px: 0,
+                ..config
+            },
+        );
         assert_eq!(pixel(&radius_zero, 20, 0, 10), 0x4d00_0000);
         assert_eq!(pixel(&radius_zero, 20, 0, 12), 0x1a00_0000);
 
         let mut scaled = vec![0; 160 * 58 * 4];
-        paint(&mut scaled, Edge::Top, 160, 58, 2, 10, 16);
+        paint(&mut scaled, Edge::Top, 160, 58, 2, config);
         for y in 0..29 {
             for x in 0..80 {
                 let expected = pixel(&top, 80, x, y);
