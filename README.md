@@ -19,6 +19,8 @@ packages.${pkgs.system}.default = inputs.temporalshell.packages.${pkgs.system}.d
 ```sh
 temporalShell
 temporalShell available
+temporalshell
+temporalshell available
 ```
 
 ## Config
