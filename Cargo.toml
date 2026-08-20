@@ -14,6 +14,6 @@ path = "src/main.rs"
 name = "temporalshell"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit = { version = "0.19", default-features = false }
 wayland-client = "0.31"
