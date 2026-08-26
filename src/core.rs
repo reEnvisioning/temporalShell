@@ -4,8 +4,8 @@ use std::{
     path::PathBuf,
 };
 
-const DEFAULT_BORDER: u32 = 10;
-const DEFAULT_CORNER_RADIUS: u32 = 16;
+const DEFAULT_BORDER: u32 = 7;
+const DEFAULT_CORNER_RADIUS: u32 = 0;
 const DEFAULT_SHADOW_STRENGTH_PERCENT: u32 = 100;
 const DEFAULT_SHADOW_COLOR: u32 = 0x000000;
 pub(crate) const SHADOW_WIDTH: u32 = 3;
@@ -303,7 +303,15 @@ mod tests {
 
     #[test]
     fn config_is_strict_and_defaults() {
-        assert_eq!(parse_config("").unwrap(), Config::default());
+        assert_eq!(
+            parse_config("").unwrap(),
+            Config {
+                border_thickness_px: 7,
+                corner_radius_px: 0,
+                shadow_strength_percent: 100,
+                shadow_color: 0x000000,
+            }
+        );
         assert_eq!(
             parse_config(
                 "# border\nborder_thickness_px = 24\ncorner_radius_px = 8\nshadow_strength_percent = 0\nshadow_color = \"#a1B2c3\"\n"
@@ -371,7 +379,7 @@ mod tests {
         assert_eq!(
             top_pixel(
                 40,
-                9,
+                6,
                 80,
                 Config {
                     shadow_strength_percent: 0,
@@ -385,7 +393,10 @@ mod tests {
 
     #[test]
     fn shadow_geometry_is_mirrored_and_scaled() {
-        let config = Config::default();
+        let config = Config {
+            corner_radius_px: 16,
+            ..Config::default()
+        };
         let mut top = vec![0; 80 * 29 * 4];
         let mut bottom = vec![0; 80 * 29 * 4];
         let mut left = vec![0; 13 * 80 * 4];
@@ -400,11 +411,11 @@ mod tests {
                 assert_eq!(pixel(&top, 80, x, y), pixel(&bottom, 80, x, 28 - y));
             }
         }
-        assert_eq!(pixel(&left, 13, 0, 28), 0);
-        assert_eq!(pixel(&left, 13, 0, 29), 0xff00_0000);
-        assert_eq!(pixel(&left, 13, 10, 29), 0x4d00_0000);
-        assert_eq!(pixel(&left, 13, 12, 29), 0x1a00_0000);
-        assert_eq!(pixel(&left, 13, 0, 51), 0);
+        assert_eq!(pixel(&left, 13, 0, 25), 0);
+        assert_eq!(pixel(&left, 13, 0, 26), 0xff00_0000);
+        assert_eq!(pixel(&left, 13, 7, 29), 0x4d00_0000);
+        assert_eq!(pixel(&left, 13, 9, 29), 0x1a00_0000);
+        assert_eq!(pixel(&left, 13, 0, 54), 0);
         for y in 0..80 {
             for x in 0..13 {
                 assert_eq!(pixel(&left, 13, x, y), pixel(&right, 13, 12 - x, y));
@@ -423,8 +434,8 @@ mod tests {
                 ..config
             },
         );
-        assert_eq!(pixel(&radius_zero, 20, 0, 10), 0x4d00_0000);
-        assert_eq!(pixel(&radius_zero, 20, 0, 12), 0x1a00_0000);
+        assert_eq!(pixel(&radius_zero, 20, 0, 7), 0x4d00_0000);
+        assert_eq!(pixel(&radius_zero, 20, 0, 9), 0x1a00_0000);
 
         let mut scaled = vec![0; 160 * 58 * 4];
         paint(&mut scaled, Edge::Top, 160, 58, 2, config);
