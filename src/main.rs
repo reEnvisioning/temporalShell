@@ -4,6 +4,7 @@ mod cli;
 mod core;
 #[cfg(target_os = "linux")]
 mod linux;
+mod timer;
 
 fn main() {
     let tool = env::args()
@@ -13,16 +14,28 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match cli::parse(&args) {
         Ok(cli::Command::Help) => print!("{}", cli::help(&tool)),
-        Ok(command) => run_platform(command, &tool),
-        Err(error) => {
-            eprintln!("{tool}: {error}\nrun '{tool} help'");
-            process::exit(2);
-        }
+        Ok(cli::Command::Timer(command)) => match timer::run(&command) {
+            Ok(output) => print!("{output}"),
+            Err(timer::Error::Input(error)) => usage_error(&tool, &error),
+            Err(timer::Error::Runtime(error)) => runtime_error(&tool, &error),
+        },
+        Ok(command) => run_platform(&command, &tool),
+        Err(error) => usage_error(&tool, error),
     }
 }
 
+fn usage_error(tool: &str, error: &str) -> ! {
+    eprintln!("{tool}: {error}\nrun '{tool} help'");
+    process::exit(2);
+}
+
+fn runtime_error(tool: &str, error: &str) -> ! {
+    eprintln!("{tool}: {error}");
+    process::exit(1);
+}
+
 #[cfg(target_os = "linux")]
-fn run_platform(command: cli::Command, tool: &str) {
+fn run_platform(command: &cli::Command, tool: &str) {
     match linux::run(command) {
         Ok(()) => {}
         Err(linux::RunError::Shell(reason)) | Err(linux::RunError::Unavailable(reason)) => {
@@ -38,7 +51,7 @@ fn run_platform(command: cli::Command, tool: &str) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_platform(command: cli::Command, _: &str) {
+fn run_platform(command: &cli::Command, _: &str) {
     let action = if matches!(command, cli::Command::Available) {
         "available"
     } else {

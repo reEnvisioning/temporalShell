@@ -55,11 +55,11 @@ pub(crate) enum RunError {
     Unavailable(String),
 }
 
-pub(crate) fn run(command: crate::cli::Command) -> Result<(), RunError> {
+pub(crate) fn run(command: &crate::cli::Command) -> Result<(), RunError> {
     match command {
         crate::cli::Command::Shell => shell().map_err(RunError::Shell),
         crate::cli::Command::Available => available_command().map_err(RunError::Unavailable),
-        crate::cli::Command::Help => Ok(()),
+        crate::cli::Command::Help | crate::cli::Command::Timer(_) => Ok(()),
     }
 }
 

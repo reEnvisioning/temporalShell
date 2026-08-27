@@ -5,6 +5,7 @@ use std::{
 };
 
 const DEFAULT_BORDER: u32 = 7;
+const DEFAULT_EVENT_LINE_THICKNESS: u32 = 3;
 const DEFAULT_CORNER_RADIUS: u32 = 0;
 const DEFAULT_SHADOW_STRENGTH_PERCENT: u32 = 100;
 const DEFAULT_SHADOW_COLOR: u32 = 0x000000;
@@ -17,6 +18,7 @@ const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Config {
     pub(crate) border_thickness_px: u32,
+    pub(crate) event_line_thickness_px: u32,
     pub(crate) corner_radius_px: u32,
     pub(crate) shadow_strength_percent: u32,
     pub(crate) shadow_color: u32,
@@ -26,6 +28,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             border_thickness_px: DEFAULT_BORDER,
+            event_line_thickness_px: DEFAULT_EVENT_LINE_THICKNESS,
             corner_radius_px: DEFAULT_CORNER_RADIUS,
             shadow_strength_percent: DEFAULT_SHADOW_STRENGTH_PERCENT,
             shadow_color: DEFAULT_SHADOW_COLOR,
@@ -81,6 +84,7 @@ fn absolute_path(name: &str, value: std::ffi::OsString) -> Result<PathBuf, Strin
 
 fn parse_config(text: &str) -> Result<Config, String> {
     let mut border = None;
+    let mut event_line = None;
     let mut radius = None;
     let mut shadow_strength = None;
     let mut shadow_color = None;
@@ -115,7 +119,10 @@ fn parse_config(text: &str) -> Result<Config, String> {
                         .map_err(|_| format!("line {}: shadow_color is invalid", index + 1))?,
                 );
             }
-            "border_thickness_px" | "corner_radius_px" | "shadow_strength_percent" => {
+            "border_thickness_px"
+            | "event_line_thickness_px"
+            | "corner_radius_px"
+            | "shadow_strength_percent" => {
                 if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                     return Err(format!("line {}: {key} must be an integer", index + 1));
                 }
@@ -134,6 +141,12 @@ fn parse_config(text: &str) -> Result<Config, String> {
                     ));
                         }
                         border = Some(value);
+                    }
+                    "event_line_thickness_px" => {
+                        if event_line.is_some() {
+                            return Err(format!("line {}: duplicate key", index + 1));
+                        }
+                        event_line = Some(value);
                     }
                     "corner_radius_px" => {
                         if radius.is_some() {
@@ -165,8 +178,15 @@ fn parse_config(text: &str) -> Result<Config, String> {
             _ => return Err(format!("line {}: unknown key", index + 1)),
         }
     }
+    let border_thickness_px = border.unwrap_or(DEFAULT_BORDER);
+    let event_line_thickness_px =
+        event_line.unwrap_or(DEFAULT_EVENT_LINE_THICKNESS.min(border_thickness_px));
+    if !(1..=border_thickness_px).contains(&event_line_thickness_px) {
+        return Err("event_line_thickness_px must be between 1 and border_thickness_px".into());
+    }
     Ok(Config {
-        border_thickness_px: border.unwrap_or(DEFAULT_BORDER),
+        border_thickness_px,
+        event_line_thickness_px,
         corner_radius_px: radius.unwrap_or(DEFAULT_CORNER_RADIUS),
         shadow_strength_percent: shadow_strength.unwrap_or(DEFAULT_SHADOW_STRENGTH_PERCENT),
         shadow_color: shadow_color.unwrap_or(DEFAULT_SHADOW_COLOR),
@@ -307,6 +327,7 @@ mod tests {
             parse_config("").unwrap(),
             Config {
                 border_thickness_px: 7,
+                event_line_thickness_px: 3,
                 corner_radius_px: 0,
                 shadow_strength_percent: 100,
                 shadow_color: 0x000000,
@@ -314,11 +335,12 @@ mod tests {
         );
         assert_eq!(
             parse_config(
-                "# border\nborder_thickness_px = 24\ncorner_radius_px = 8\nshadow_strength_percent = 0\nshadow_color = \"#a1B2c3\"\n"
+                "# border\nborder_thickness_px = 24\nevent_line_thickness_px = 8\ncorner_radius_px = 8\nshadow_strength_percent = 0\nshadow_color = \"#a1B2c3\"\n"
             )
             .unwrap(),
             Config {
                 border_thickness_px: 24,
+                event_line_thickness_px: 8,
                 corner_radius_px: 8,
                 shadow_strength_percent: 0,
                 shadow_color: 0xa1b2c3,
@@ -331,11 +353,24 @@ mod tests {
                 ..Config::default()
             }
         );
+        for (border, line) in [(1, 1), (2, 2), (4, 3), (7, 3)] {
+            assert_eq!(
+                parse_config(&format!("border_thickness_px = {border}"))
+                    .unwrap()
+                    .event_line_thickness_px,
+                line
+            );
+        }
         for invalid in [
             "border_thickness_px = nope",
             "border_thickness_px = -1",
             "border_thickness_px = 0",
             "border_thickness_px = 257",
+            "event_line_thickness_px = 0",
+            "event_line_thickness_px = 8",
+            "border_thickness_px = 7\nevent_line_thickness_px = 8",
+            "border_thickness_px = 8\nevent_line_thickness_px = 10",
+            "event_line_thickness_px = 3\nevent_line_thickness_px = 5",
             "corner_radius_px = -1",
             "corner_radius_px = 257",
             "shadow_strength_percent = -1",
@@ -363,6 +398,25 @@ mod tests {
     fn pixel(canvas: &[u8], width: u32, x: u32, y: u32) -> u32 {
         let start = ((y * width + x) * 4) as usize;
         u32::from_le_bytes(canvas[start..start + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn event_line_config_does_not_change_raster() {
+        let mut default_line = vec![0; 20 * 13 * 4];
+        let mut alternate_line = vec![0; 20 * 13 * 4];
+        paint(&mut default_line, Edge::Top, 20, 13, 1, Config::default());
+        paint(
+            &mut alternate_line,
+            Edge::Top,
+            20,
+            13,
+            1,
+            Config {
+                event_line_thickness_px: 1,
+                ..Config::default()
+            },
+        );
+        assert_eq!(default_line, alternate_line);
     }
 
     #[test]

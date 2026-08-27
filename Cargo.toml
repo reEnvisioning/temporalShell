@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "temporalshell"
 path = "src/main.rs"
 
+[dependencies]
+getrandom = "0.3"
+time = { version = "0.3", default-features = false, features = ["formatting", "parsing", "std"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit = { version = "0.19", default-features = false }
 wayland-client = "0.31"
