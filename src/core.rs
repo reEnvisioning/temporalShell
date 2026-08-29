@@ -4,11 +4,11 @@ use std::{
     path::PathBuf,
 };
 
-const DEFAULT_BORDER: u32 = 7;
+const DEFAULT_BORDER: u32 = 10;
 const DEFAULT_EVENT_LINE_THICKNESS: u32 = 3;
 const DEFAULT_CORNER_RADIUS: u32 = 0;
-const DEFAULT_SHADOW_STRENGTH_PERCENT: u32 = 100;
-const DEFAULT_SHADOW_COLOR: u32 = 0x000000;
+const DEFAULT_SHADOW_STRENGTH_PERCENT: u32 = 35;
+const DEFAULT_SHADOW_COLOR: u32 = 0xb8a890;
 pub(crate) const SHADOW_WIDTH: u32 = 3;
 const SHADOW: [u32; SHADOW_WIDTH as usize] = [0x4d, 0x33, 0x1a];
 const MAX_CONFIG_VALUE: u32 = 256;
@@ -259,7 +259,9 @@ fn shadow(distance: u32, strength: u32, color: u32) -> u32 {
 
 fn side_pixel(x: u32, y: u32, width: u32, height: u32, edge: Edge, config: Config) -> u32 {
     let corner_extent = config.border_thickness_px + config.corner_radius_px + SHADOW_WIDTH;
-    if y < corner_extent || y >= height.saturating_sub(corner_extent) {
+    if config.corner_radius_px != 0
+        && (y < corner_extent || y >= height.saturating_sub(corner_extent))
+    {
         return 0;
     }
     let x = match edge {
@@ -326,11 +328,11 @@ mod tests {
         assert_eq!(
             parse_config("").unwrap(),
             Config {
-                border_thickness_px: 7,
+                border_thickness_px: 10,
                 event_line_thickness_px: 3,
                 corner_radius_px: 0,
-                shadow_strength_percent: 100,
-                shadow_color: 0x000000,
+                shadow_strength_percent: 35,
+                shadow_color: 0xb8a890,
             }
         );
         assert_eq!(
@@ -349,11 +351,12 @@ mod tests {
         assert_eq!(
             parse_config("shadow_strength_percent = 100\nshadow_color = \"#ABCDEF\"").unwrap(),
             Config {
+                shadow_strength_percent: 100,
                 shadow_color: 0xabcdef,
                 ..Config::default()
             }
         );
-        for (border, line) in [(1, 1), (2, 2), (4, 3), (7, 3)] {
+        for (border, line) in [(1, 1), (2, 2), (4, 3), (10, 3)] {
             assert_eq!(
                 parse_config(&format!("border_thickness_px = {border}"))
                     .unwrap()
@@ -367,7 +370,7 @@ mod tests {
             "border_thickness_px = 0",
             "border_thickness_px = 257",
             "event_line_thickness_px = 0",
-            "event_line_thickness_px = 8",
+            "event_line_thickness_px = 11",
             "border_thickness_px = 7\nevent_line_thickness_px = 8",
             "border_thickness_px = 8\nevent_line_thickness_px = 10",
             "event_line_thickness_px = 3\nevent_line_thickness_px = 5",
@@ -421,6 +424,30 @@ mod tests {
 
     #[test]
     fn shadow_strength_and_color_are_premultiplied() {
+        assert_eq!(
+            shadow(
+                0,
+                Config::default().shadow_strength_percent,
+                Config::default().shadow_color
+            ),
+            0x1b13_120f
+        );
+        assert_eq!(
+            shadow(
+                1,
+                Config::default().shadow_strength_percent,
+                Config::default().shadow_color
+            ),
+            0x120d_0c0a
+        );
+        assert_eq!(
+            shadow(
+                2,
+                Config::default().shadow_strength_percent,
+                Config::default().shadow_color
+            ),
+            0x0906_0605
+        );
         assert_eq!(shadow(0, 100, 0), 0x4d00_0000);
         assert_eq!(shadow(1, 100, 0), 0x3300_0000);
         assert_eq!(shadow(2, 100, 0), 0x1a00_0000);
@@ -448,7 +475,10 @@ mod tests {
     #[test]
     fn shadow_geometry_is_mirrored_and_scaled() {
         let config = Config {
+            border_thickness_px: 7,
             corner_radius_px: 16,
+            shadow_strength_percent: 100,
+            shadow_color: 0,
             ..Config::default()
         };
         let mut top = vec![0; 80 * 29 * 4];
@@ -476,20 +506,17 @@ mod tests {
             }
         }
 
-        let mut radius_zero = vec![0; 20 * 13 * 4];
-        paint(
-            &mut radius_zero,
-            Edge::Top,
-            20,
-            13,
-            1,
-            Config {
-                corner_radius_px: 0,
-                ..config
-            },
-        );
-        assert_eq!(pixel(&radius_zero, 20, 0, 7), 0x4d00_0000);
-        assert_eq!(pixel(&radius_zero, 20, 0, 9), 0x1a00_0000);
+        let radius_zero_config = Config {
+            corner_radius_px: 0,
+            ..config
+        };
+        let mut radius_zero = vec![0; 13 * 29 * 4];
+        paint(&mut radius_zero, Edge::Left, 13, 29, 1, radius_zero_config);
+        for y in 0..29 {
+            assert_eq!(pixel(&radius_zero, 13, 0, y), 0xff00_0000);
+            assert_eq!(pixel(&radius_zero, 13, 7, y), 0x4d00_0000);
+            assert_eq!(pixel(&radius_zero, 13, 9, y), 0x1a00_0000);
+        }
 
         let mut scaled = vec![0; 160 * 58 * 4];
         paint(&mut scaled, Edge::Top, 160, 58, 2, config);
@@ -500,6 +527,13 @@ mod tests {
                 assert_eq!(pixel(&scaled, 160, x * 2 + 1, y * 2 + 1), expected);
             }
         }
+
+        let mut scaled_side = vec![0; 26 * 58 * 4];
+        paint(&mut scaled_side, Edge::Left, 26, 58, 2, radius_zero_config);
+        assert_eq!(pixel(&scaled_side, 26, 0, 0), 0xff00_0000);
+        assert_eq!(pixel(&scaled_side, 26, 1, 1), 0xff00_0000);
+        assert_eq!(pixel(&scaled_side, 26, 14, 56), 0x4d00_0000);
+        assert_eq!(pixel(&scaled_side, 26, 15, 57), 0x4d00_0000);
     }
 
     #[test]

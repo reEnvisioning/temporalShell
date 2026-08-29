@@ -32,15 +32,15 @@ temporalshell timer add 10s
 `${XDG_CONFIG_HOME:-$HOME/.config}/reEnvisioning/temporalShell/config.toml`:
 
 ```toml
-border_thickness_px = 7
+border_thickness_px = 10
 event_line_thickness_px = 3
 corner_radius_px = 0
-shadow_strength_percent = 100
-shadow_color = "#000000"
+shadow_strength_percent = 35
+shadow_color = "#B8A890"
 ```
 
-`border_thickness_px` is 1–256 (default 7). `event_line_thickness_px` is 1 through the border thickness and defaults to 3, or to the border thickness when that is smaller; it is stored for a future event line and does not change the current black border. `corner_radius_px` is 0–256 (default 0).
-`shadow_strength_percent` is 0–100 (default 100) and multiplies the fixed 30% → 20% → 10% three-band inward-shadow ramp; `0` disables the shadow. `shadow_color` is strictly quoted `"#RRGGBB"` ASCII hex (default `"#000000"`); its RGB is premultiplied internally. The border remains sharp, opaque black.
+`border_thickness_px` is 1–256 (default 10). `event_line_thickness_px` is 1 through the border thickness and defaults to 3, or to the border thickness when that is smaller; it is stored for a future event line and does not change the current black border. `corner_radius_px` is 0–256 (default 0).
+`shadow_strength_percent` is 0–100 (default 35) and multiplies the fixed 30% → 20% → 10% three-band inward-shadow ramp; `0` disables the shadow. `shadow_color` is strictly quoted `"#RRGGBB"` ASCII hex (default `"#B8A890"`); its RGB is premultiplied internally. The default is a 10px opaque black square frame with this inward shadow. Event-line and timer rendering remain absent.
 Requires a Wayland compositor advertising `wlr-layer-shell`; no X11 support.
 The CLI is distro-neutral across NixOS, Void, and Arch, runs in the foreground, and does not require systemd; start it from a shell, compositor startup, runit, or any supervisor you trust. macOS builds only keep help/parsing/core validation available; drawing borders is Linux Wayland-only.
 
