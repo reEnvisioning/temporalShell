@@ -22,20 +22,23 @@ use wayland_client::{
     Connection, EventQueue, QueueHandle,
 };
 
-use crate::core::{buffer_dimensions, paint, Config, Edge, SHADOW_WIDTH};
+use crate::core::{buffer_dimensions, paint, Config};
 
-struct Strip {
-    edge: Edge,
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    width: u32,
+    height: u32,
+    scale: i32,
+}
+
+struct OutputBorder {
+    output: wl_output::WlOutput,
     layer: LayerSurface,
     size: Option<(u32, u32)>,
     scale: i32,
+    pool: SlotPool,
     buffer: Option<Buffer>,
-    buffer_size: Option<(i32, i32)>,
-}
-
-struct OutputBorders {
-    output: wl_output::WlOutput,
-    strips: [Strip; 4],
+    render_key: Option<RenderKey>,
 }
 
 struct App {
@@ -44,9 +47,8 @@ struct App {
     output_state: OutputState,
     shm: Shm,
     layer_shell: LayerShell,
-    pool: SlotPool,
     config: Config,
-    outputs: Vec<OutputBorders>,
+    outputs: Vec<OutputBorder>,
     error: Option<String>,
 }
 
@@ -76,7 +78,6 @@ fn initialize(config: Config) -> Result<(EventQueue<App>, App), String> {
     })?;
     let shm =
         Shm::bind(&globals, &qh).map_err(|error| format!("missing wl_shm capability: {error}"))?;
-    let pool = SlotPool::new(1, &shm).map_err(|error| error.to_string())?;
     Ok((
         queue,
         App {
@@ -85,7 +86,6 @@ fn initialize(config: Config) -> Result<(EventQueue<App>, App), String> {
             output_state: OutputState::new(&globals, &qh),
             shm,
             layer_shell,
-            pool,
             config,
             outputs: Vec::new(),
             error: None,
@@ -116,12 +116,11 @@ fn shell() -> Result<(), String> {
 }
 
 impl App {
-    fn create_strip(
+    fn create_output_surface(
         &self,
         qh: &QueueHandle<Self>,
         output: &wl_output::WlOutput,
-        edge: Edge,
-    ) -> Result<Strip, String> {
+    ) -> Result<OutputBorder, String> {
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -130,26 +129,8 @@ impl App {
             Some("temporalshell"),
             Some(output),
         );
-        let border = self.config.border_thickness_px;
-        let corner_strip = border + self.config.corner_radius_px + SHADOW_WIDTH;
-        match edge {
-            Edge::Top => {
-                layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-                layer.set_size(0, corner_strip);
-            }
-            Edge::Bottom => {
-                layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-                layer.set_size(0, corner_strip);
-            }
-            Edge::Left => {
-                layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT);
-                layer.set_size(border + SHADOW_WIDTH, 0);
-            }
-            Edge::Right => {
-                layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::RIGHT);
-                layer.set_size(border + SHADOW_WIDTH, 0);
-            }
-        }
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_size(0, 0);
         layer.set_exclusive_zone(0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         let region = Region::new(&self.compositor).map_err(|error| error.to_string())?;
@@ -157,62 +138,45 @@ impl App {
             .wl_surface()
             .set_input_region(Some(region.wl_region()));
         layer.commit();
-        Ok(Strip {
-            edge,
+        Ok(OutputBorder {
+            output: output.clone(),
             layer,
             size: None,
             scale: 1,
+            pool: SlotPool::new(1, &self.shm).map_err(|error| error.to_string())?,
             buffer: None,
-            buffer_size: None,
+            render_key: None,
         })
     }
 
-    fn strip_index(&self, layer: &LayerSurface) -> Option<usize> {
+    fn output_index(&self, layer: &LayerSurface) -> Option<usize> {
         self.outputs
             .iter()
-            .position(|borders| borders.strips.iter().any(|strip| strip.layer == *layer))
-            .and_then(|output_index| {
-                self.outputs[output_index]
-                    .strips
-                    .iter()
-                    .position(|strip| strip.layer == *layer)
-                    .map(|strip_index| output_index * 4 + strip_index)
-            })
-    }
-
-    fn strip_mut(&mut self, index: usize) -> &mut Strip {
-        &mut self.outputs[index / 4].strips[index % 4]
+            .position(|output| output.layer == *layer)
     }
 
     fn redraw(&mut self, index: usize) -> Result<(), String> {
-        let (edge, width, height, scale) = match self.strip_mut(index) {
-            Strip {
-                edge,
-                size: Some((width, height)),
-                scale,
-                ..
-            } => (*edge, *width, *height, *scale),
-            _ => return Ok(()),
+        let (width, height, scale) = match self.outputs[index].size {
+            Some((width, height)) => (width, height, self.outputs[index].scale),
+            None => return Ok(()),
         };
+        let key = RenderKey {
+            width,
+            height,
+            scale,
+        };
+        if self.outputs[index].render_key == Some(key) {
+            return Ok(());
+        }
         let (pixel_width, pixel_height, stride, bytes) = buffer_dimensions(width, height, scale)?;
-        let strip = self.strip_mut(index);
-        let old_buffer = strip.buffer.take();
-        let old_size = strip.buffer_size.take();
-        if let Some(buffer) = old_buffer {
-            if old_size == Some((pixel_width, pixel_height)) {
-                let strip = self.strip_mut(index);
-                strip.buffer = Some(buffer);
-                strip.buffer_size = old_size;
-                return Ok(());
-            }
-            if buffer.canvas(&mut self.pool).is_none() {
-                let strip = self.strip_mut(index);
-                strip.buffer = Some(buffer);
-                strip.buffer_size = old_size;
+        let output = &mut self.outputs[index];
+        if let Some(buffer) = output.buffer.take() {
+            if buffer.canvas(&mut output.pool).is_none() {
+                output.buffer = Some(buffer);
                 return Ok(());
             }
         }
-        let (buffer, canvas) = self
+        let (buffer, canvas) = output
             .pool
             .create_buffer(pixel_width, pixel_height, stride, wl_shm::Format::Argb8888)
             .map_err(|error| error.to_string())?;
@@ -221,39 +185,33 @@ impl App {
         }
         paint(
             canvas,
-            edge,
             pixel_width as u32,
             pixel_height as u32,
             scale as u32,
             self.config,
         );
-        let layer = self.strip_mut(index).layer.clone();
-        layer
+        output
+            .layer
             .wl_surface()
             .damage_buffer(0, 0, pixel_width, pixel_height);
         buffer
-            .attach_to(layer.wl_surface())
+            .attach_to(output.layer.wl_surface())
             .map_err(|error| error.to_string())?;
-        layer.commit();
-        let strip = self.strip_mut(index);
-        strip.buffer = Some(buffer);
-        strip.buffer_size = Some((pixel_width, pixel_height));
+        output.layer.commit();
+        output.buffer = Some(buffer);
+        output.render_key = Some(key);
         Ok(())
     }
 
     fn refresh_pending(&mut self) -> Result<(), String> {
-        for index in 0..self.outputs.len() * 4 {
+        for index in 0..self.outputs.len() {
             self.redraw(index)?;
         }
         Ok(())
     }
 
     fn remove_output_for_layer(&mut self, layer: &LayerSurface) {
-        if let Some(index) = self
-            .outputs
-            .iter()
-            .position(|borders| borders.strips.iter().any(|strip| strip.layer == *layer))
-        {
+        if let Some(index) = self.output_index(layer) {
             self.outputs.remove(index);
         }
     }
@@ -272,11 +230,9 @@ impl CompositorHandler for App {
             return;
         }
         for output in &mut self.outputs {
-            for strip in &mut output.strips {
-                if strip.layer.wl_surface() == surface {
-                    strip.scale = scale;
-                    surface.set_buffer_scale(scale);
-                }
+            if output.layer.wl_surface() == surface {
+                output.scale = scale;
+                surface.set_buffer_scale(scale);
             }
         }
     }
@@ -314,19 +270,11 @@ impl OutputHandler for App {
     }
 
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        if self.outputs.iter().any(|borders| borders.output == output) {
+        if self.outputs.iter().any(|border| border.output == output) {
             return;
         }
-        let strips = (|| {
-            Ok([
-                self.create_strip(qh, &output, Edge::Top)?,
-                self.create_strip(qh, &output, Edge::Bottom)?,
-                self.create_strip(qh, &output, Edge::Left)?,
-                self.create_strip(qh, &output, Edge::Right)?,
-            ])
-        })();
-        match strips {
-            Ok(strips) => self.outputs.push(OutputBorders { output, strips }),
+        match self.create_output_surface(qh, &output) {
+            Ok(border) => self.outputs.push(border),
             Err(error) => self.error = Some(error),
         }
     }
@@ -342,7 +290,7 @@ impl OutputHandler for App {
         if let Some(index) = self
             .outputs
             .iter()
-            .position(|borders| borders.output == output)
+            .position(|border| border.output == output)
         {
             self.outputs.remove(index);
         }
@@ -363,11 +311,11 @@ impl LayerShellHandler for App {
         _: u32,
     ) {
         if configure.new_size.0 == 0 || configure.new_size.1 == 0 {
-            self.error = Some("compositor configured a zero-sized border strip".into());
+            self.error = Some("compositor configured a zero-sized output border".into());
             return;
         }
-        if let Some(index) = self.strip_index(layer) {
-            self.strip_mut(index).size = Some(configure.new_size);
+        if let Some(index) = self.output_index(layer) {
+            self.outputs[index].size = Some(configure.new_size);
             if let Err(error) = self.redraw(index) {
                 self.error = Some(error);
             }
