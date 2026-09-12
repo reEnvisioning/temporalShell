@@ -1,3 +1,12 @@
+use std::{
+    io::ErrorKind,
+    time::{Duration, Instant},
+};
+
+use rustix::{
+    event::{poll, PollFd, PollFlags, Timespec},
+    io::Errno,
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -16,19 +25,75 @@ use smithay_client_toolkit::{
         Shm, ShmHandler,
     },
 };
+use time::OffsetDateTime;
 use wayland_client::{
+    backend::WaylandError,
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
     Connection, EventQueue, QueueHandle,
 };
 
-use crate::core::{buffer_dimensions, paint, Config};
+use crate::core::{buffer_dimensions, paint, timer_frame, Animation, Config, TimerFrame};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+const RELOAD_INTERVAL: Duration = Duration::from_millis(250);
+const BLINK_INTERVAL_NS: i128 = 250_000_000;
+const FADE_NS: i128 = 250_000_000;
+const BUFFER_RETRY: Duration = Duration::from_millis(16);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RenderKey {
     width: u32,
     height: u32,
     scale: i32,
+}
+
+struct RenderState {
+    render_key: Option<RenderKey>,
+    dirty: bool,
+    frame_pending: bool,
+    retry_at: Option<Instant>,
+}
+
+impl RenderState {
+    fn new() -> Self {
+        Self {
+            render_key: None,
+            dirty: true,
+            frame_pending: false,
+            retry_at: None,
+        }
+    }
+
+    fn reset_after_detach(&mut self, key: RenderKey) {
+        self.render_key = Some(key);
+        self.dirty = false;
+        self.frame_pending = false;
+        self.retry_at = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoDisposition {
+    Retry,
+    WaitWritable,
+    Fatal,
+}
+
+fn io_disposition(kind: ErrorKind) -> IoDisposition {
+    match kind {
+        ErrorKind::Interrupted => IoDisposition::Retry,
+        ErrorKind::WouldBlock => IoDisposition::WaitWritable,
+        _ => IoDisposition::Fatal,
+    }
+}
+
+fn needs_pool_reset(render_key: Option<RenderKey>, key: RenderKey) -> bool {
+    render_key.is_some_and(|old_key| old_key != key)
+}
+
+struct BufferSlot {
+    buffer: Buffer,
+    key: RenderKey,
 }
 
 struct OutputBorder {
@@ -37,19 +102,26 @@ struct OutputBorder {
     size: Option<(u32, u32)>,
     scale: i32,
     pool: SlotPool,
-    buffer: Option<Buffer>,
-    render_key: Option<RenderKey>,
+    buffers: Vec<BufferSlot>,
+    state: RenderState,
 }
 
 struct App {
+    connection: Connection,
     registry_state: RegistryState,
     compositor: CompositorState,
     output_state: OutputState,
     shm: Shm,
     layer_shell: LayerShell,
     config: Config,
+    deadlines: Vec<i128>,
     outputs: Vec<OutputBorder>,
     error: Option<String>,
+    config_diagnostic: Option<String>,
+    timer_diagnostic: Option<String>,
+    render_diagnostic: Option<String>,
+    next_reload: Instant,
+    visual_key: Option<(i128, bool, bool)>,
 }
 
 pub(crate) enum RunError {
@@ -65,7 +137,7 @@ pub(crate) fn run(command: &crate::cli::Command) -> Result<(), RunError> {
     }
 }
 
-fn initialize(config: Config) -> Result<(EventQueue<App>, App), String> {
+fn initialize(config: Config, deadlines: Vec<i128>) -> Result<(EventQueue<App>, App), String> {
     let connection = Connection::connect_to_env()
         .map_err(|error| format!("cannot connect to a Wayland display: {error}"))?;
     let (globals, queue) = registry_queue_init(&connection)
@@ -81,20 +153,27 @@ fn initialize(config: Config) -> Result<(EventQueue<App>, App), String> {
     Ok((
         queue,
         App {
+            connection: connection.clone(),
             registry_state: RegistryState::new(&globals),
             compositor,
             output_state: OutputState::new(&globals, &qh),
             shm,
             layer_shell,
             config,
+            deadlines,
             outputs: Vec::new(),
             error: None,
+            config_diagnostic: None,
+            timer_diagnostic: None,
+            render_diagnostic: None,
+            next_reload: Instant::now() + RELOAD_INTERVAL,
+            visual_key: None,
         },
     ))
 }
 
 fn available_command() -> Result<(), String> {
-    let (_, app) = initialize(Config::default())?;
+    let (_, app) = initialize(Config::default(), Vec::new())?;
     if app.output_state.outputs().next().is_none() {
         return Err("no Wayland outputs available".into());
     }
@@ -103,15 +182,77 @@ fn available_command() -> Result<(), String> {
 }
 
 fn shell() -> Result<(), String> {
-    let (mut queue, mut app) = initialize(Config::load()?)?;
+    let (mut queue, mut app) = initialize(Config::load_or_create()?, crate::timer::snapshot()?)?;
     loop {
         queue
-            .blocking_dispatch(&mut app)
+            .dispatch_pending(&mut app)
             .map_err(|error| error.to_string())?;
         if let Some(error) = app.error.take() {
             return Err(error);
         }
-        app.refresh_pending()?;
+        app.reload();
+        app.update_visual_key();
+        let qh = queue.handle();
+        app.refresh_pending(&qh)?;
+        let flush_pending = loop {
+            match queue.flush() {
+                Ok(()) => break false,
+                Err(WaylandError::Io(error)) => match io_disposition(error.kind()) {
+                    IoDisposition::Retry => continue,
+                    IoDisposition::WaitWritable => break true,
+                    IoDisposition::Fatal => return Err(error.to_string()),
+                },
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+
+        let guard = match queue.prepare_read() {
+            Some(guard) => guard,
+            None => continue,
+        };
+        let events = poll_wayland(&app, flush_pending)?;
+        if events.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+            return Err("Wayland connection poll failed".into());
+        }
+        if events.contains(PollFlags::IN) {
+            match guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(error))
+                    if matches!(
+                        io_disposition(error.kind()),
+                        IoDisposition::Retry | IoDisposition::WaitWritable
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+}
+
+fn poll_wayland(app: &App, want_write: bool) -> Result<PollFlags, String> {
+    let deadline = Instant::now() + app.timeout();
+    loop {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Ok(PollFlags::empty());
+        }
+        let requested = PollFlags::IN
+            | if want_write {
+                PollFlags::OUT
+            } else {
+                PollFlags::empty()
+            };
+        let backend = app.connection.backend();
+        let mut fds = [PollFd::from_borrowed_fd(backend.poll_fd(), requested)];
+        let timeout = Timespec::try_from(timeout).map_err(|_| "poll timeout is invalid")?;
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) => return Ok(fds[0].revents()),
+            Err(Errno::INTR) if Instant::now() < deadline => continue,
+            Err(Errno::INTR) => return Ok(PollFlags::empty()),
+            Err(error) => return Err(format!("Wayland poll failed: {error}")),
+        }
     }
 }
 
@@ -144,8 +285,8 @@ impl App {
             size: None,
             scale: 1,
             pool: SlotPool::new(1, &self.shm).map_err(|error| error.to_string())?,
-            buffer: None,
-            render_key: None,
+            buffers: Vec::new(),
+            state: RenderState::new(),
         })
     }
 
@@ -155,7 +296,15 @@ impl App {
             .position(|output| output.layer == *layer)
     }
 
-    fn redraw(&mut self, index: usize) -> Result<(), String> {
+    fn current_frame(&self) -> Option<TimerFrame> {
+        timer_frame(
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            &self.deadlines,
+            self.config.timer.duration_seconds,
+        )
+    }
+
+    fn redraw(&mut self, qh: &QueueHandle<Self>, index: usize) -> Result<(), String> {
         let (width, height, scale) = match self.outputs[index].size {
             Some((width, height)) => (width, height, self.outputs[index].scale),
             None => return Ok(()),
@@ -165,21 +314,72 @@ impl App {
             height,
             scale,
         };
-        if self.outputs[index].render_key == Some(key) {
+        if !self.outputs[index].state.dirty && self.outputs[index].state.render_key == Some(key) {
             return Ok(());
         }
+        if let Err(error) = self.config.validate_output(width, height) {
+            let output = &mut self.outputs[index];
+            output.layer.wl_surface().attach(None, 0, 0);
+            output.layer.commit();
+            output.state.reset_after_detach(key);
+            diagnose_once(
+                &mut self.render_diagnostic,
+                format!("timer hidden on {width}x{height} output: {error}; adjust timer start/end or use percentage bounds"),
+            );
+            return Ok(());
+        }
+        self.render_diagnostic = None;
+        let frame = self.current_frame();
+        let animate = frame.is_some_and(|frame| {
+            needs_frame_callback(self.config.timer.animation, self.config.timer.fade, frame)
+        });
         let (pixel_width, pixel_height, stride, bytes) = buffer_dimensions(width, height, scale)?;
-        let output = &mut self.outputs[index];
-        if let Some(buffer) = output.buffer.take() {
-            if buffer.canvas(&mut output.pool).is_none() {
-                output.buffer = Some(buffer);
+        if self.outputs[index]
+            .buffers
+            .iter()
+            .any(|slot| needs_pool_reset(Some(slot.key), key))
+        {
+            let released = {
+                let output = &mut self.outputs[index];
+                output
+                    .buffers
+                    .iter()
+                    .all(|slot| slot.buffer.canvas(&mut output.pool).is_some())
+            };
+            if !released {
+                self.outputs[index].state.dirty = true;
+                self.outputs[index].state.retry_at = Some(Instant::now() + BUFFER_RETRY);
                 return Ok(());
             }
+            self.outputs[index].buffers.clear();
+            let pool = SlotPool::new(1, &self.shm).map_err(|error| error.to_string())?;
+            self.outputs[index].pool = pool;
         }
-        let (buffer, canvas) = output
-            .pool
-            .create_buffer(pixel_width, pixel_height, stride, wl_shm::Format::Argb8888)
-            .map_err(|error| error.to_string())?;
+        let output = &mut self.outputs[index];
+        let buffer_index = output
+            .buffers
+            .iter()
+            .position(|slot| slot.key == key && slot.buffer.canvas(&mut output.pool).is_some());
+        let buffer_index = match buffer_index {
+            Some(index) => index,
+            None if output.buffers.len() < 2 => {
+                let (buffer, _) = output
+                    .pool
+                    .create_buffer(pixel_width, pixel_height, stride, wl_shm::Format::Argb8888)
+                    .map_err(|error| error.to_string())?;
+                output.buffers.push(BufferSlot { buffer, key });
+                output.buffers.len() - 1
+            }
+            None => {
+                output.state.dirty = true;
+                output.state.retry_at = Some(Instant::now() + BUFFER_RETRY);
+                return Ok(());
+            }
+        };
+        let canvas = output.buffers[buffer_index]
+            .buffer
+            .canvas(&mut output.pool)
+            .ok_or("released shared-memory buffer became busy")?;
         if canvas.len() < bytes {
             return Err("shared-memory buffer is smaller than requested".into());
         }
@@ -189,31 +389,158 @@ impl App {
             pixel_height as u32,
             scale as u32,
             self.config,
-        );
+            frame,
+        )?;
+        if animate && !output.state.frame_pending {
+            output
+                .layer
+                .wl_surface()
+                .frame(qh, output.layer.wl_surface().clone());
+            output.state.frame_pending = true;
+        }
         output
             .layer
             .wl_surface()
             .damage_buffer(0, 0, pixel_width, pixel_height);
-        buffer
+        output.buffers[buffer_index]
+            .buffer
             .attach_to(output.layer.wl_surface())
             .map_err(|error| error.to_string())?;
         output.layer.commit();
-        output.buffer = Some(buffer);
-        output.render_key = Some(key);
+        output.state.render_key = Some(key);
+        output.state.dirty = false;
+        output.state.retry_at = None;
         Ok(())
     }
 
-    fn refresh_pending(&mut self) -> Result<(), String> {
+    fn refresh_pending(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
         for index in 0..self.outputs.len() {
-            self.redraw(index)?;
+            self.redraw(qh, index)?;
         }
         Ok(())
+    }
+
+    fn dirty_all(&mut self) {
+        for output in &mut self.outputs {
+            output.state.dirty = true;
+        }
+    }
+
+    fn reload(&mut self) {
+        if Instant::now() < self.next_reload {
+            return;
+        }
+        self.next_reload = Instant::now() + RELOAD_INTERVAL;
+        match Config::load() {
+            Ok(config) => {
+                self.config_diagnostic = None;
+                if config != self.config {
+                    self.config = config;
+                    self.dirty_all();
+                }
+            }
+            Err(error) => diagnose_once(&mut self.config_diagnostic, error),
+        }
+        match crate::timer::snapshot() {
+            Ok(deadlines) => {
+                self.timer_diagnostic = None;
+                if deadlines != self.deadlines {
+                    self.deadlines = deadlines;
+                    self.dirty_all();
+                }
+            }
+            Err(error) => diagnose_once(&mut self.timer_diagnostic, error),
+        }
+    }
+
+    fn update_visual_key(&mut self) {
+        let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let key = self
+            .deadlines
+            .iter()
+            .copied()
+            .filter(|deadline| *deadline > now)
+            .min()
+            .and_then(|deadline| {
+                let start =
+                    deadline - i128::from(self.config.timer.duration_seconds) * 1_000_000_000;
+                (now >= start).then(|| {
+                    let visible = !matches!(self.config.timer.animation, Animation::Blink)
+                        || ((now - start) / BLINK_INTERVAL_NS) % 2 == 0;
+                    let fading_out = self.config.timer.fade && now >= deadline - FADE_NS;
+                    (deadline, visible, fading_out)
+                })
+            });
+        if key != self.visual_key {
+            self.visual_key = key;
+            self.dirty_all();
+        }
+    }
+
+    fn timeout(&self) -> Duration {
+        let now = Instant::now();
+        let reload = self.next_reload.saturating_duration_since(now);
+        self.outputs
+            .iter()
+            .filter_map(|output| output.state.retry_at)
+            .map(|retry| retry_timeout(retry, now))
+            .fold(
+                reload.min(self.visual_timeout().unwrap_or(reload)),
+                Duration::min,
+            )
+    }
+
+    fn visual_timeout(&self) -> Option<Duration> {
+        let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let deadline = self
+            .deadlines
+            .iter()
+            .copied()
+            .filter(|deadline| *deadline > now)
+            .min()?;
+        let start = deadline - i128::from(self.config.timer.duration_seconds) * 1_000_000_000;
+        let delay = if now < start {
+            start - now
+        } else {
+            let remaining = deadline - now;
+            match self.config.timer.animation {
+                Animation::Blink => {
+                    (BLINK_INTERVAL_NS - (now - start) % BLINK_INTERVAL_NS).min(remaining)
+                }
+                _ if self.config.timer.fade && remaining > FADE_NS => remaining - FADE_NS,
+                _ => remaining,
+            }
+        };
+        Some(Duration::from_nanos(
+            u64::try_from(delay.max(0)).unwrap_or(u64::MAX),
+        ))
     }
 
     fn remove_output_for_layer(&mut self, layer: &LayerSurface) {
         if let Some(index) = self.output_index(layer) {
             self.outputs.remove(index);
         }
+    }
+}
+
+fn retry_timeout(retry_at: Instant, now: Instant) -> Duration {
+    retry_at.saturating_duration_since(now)
+}
+
+fn needs_frame_callback(animation: Animation, fade: bool, frame: TimerFrame) -> bool {
+    matches!(
+        animation,
+        Animation::Expand | Animation::FlowUp | Animation::FlowDown
+    ) || (fade
+        && (matches!(animation, Animation::Blink)
+            || frame.now_ns - frame.started_ns < FADE_NS
+            || frame.deadline_ns - frame.now_ns <= FADE_NS))
+}
+
+fn diagnose_once(previous: &mut Option<String>, error: String) {
+    if previous.as_deref() != Some(&error) {
+        eprintln!("temporalshell: reload retained last valid state: {error}");
+        *previous = Some(error);
     }
 }
 
@@ -232,6 +559,7 @@ impl CompositorHandler for App {
         for output in &mut self.outputs {
             if output.layer.wl_surface() == surface {
                 output.scale = scale;
+                output.state.dirty = true;
                 surface.set_buffer_scale(scale);
             }
         }
@@ -245,7 +573,22 @@ impl CompositorHandler for App {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        for output in &mut self.outputs {
+            if output.layer.wl_surface() == surface {
+                output.state.frame_pending = false;
+                output.state.dirty = true;
+            }
+        }
+    }
+
     fn surface_enter(
         &mut self,
         _: &Connection,
@@ -305,7 +648,7 @@ impl LayerShellHandler for App {
     fn configure(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
@@ -316,7 +659,8 @@ impl LayerShellHandler for App {
         }
         if let Some(index) = self.output_index(layer) {
             self.outputs[index].size = Some(configure.new_size);
-            if let Err(error) = self.redraw(index) {
+            self.outputs[index].state.dirty = true;
+            if let Err(error) = self.redraw(qh, index) {
                 self.error = Some(error);
             }
         }
@@ -341,3 +685,71 @@ delegate_output!(App);
 delegate_shm!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_timeout_is_bounded_without_events() {
+        let now = Instant::now();
+        assert_eq!(retry_timeout(now, now), Duration::ZERO);
+        assert_eq!(retry_timeout(now + BUFFER_RETRY, now), BUFFER_RETRY);
+    }
+
+    #[test]
+    fn io_errors_are_classified_for_retry_and_writable_polling() {
+        assert_eq!(io_disposition(ErrorKind::Interrupted), IoDisposition::Retry);
+        assert_eq!(
+            io_disposition(ErrorKind::WouldBlock),
+            IoDisposition::WaitWritable
+        );
+        assert_eq!(io_disposition(ErrorKind::NotFound), IoDisposition::Fatal);
+    }
+
+    #[test]
+    fn detach_clears_pending_frame_state() {
+        let key = RenderKey {
+            width: 1,
+            height: 1,
+            scale: 1,
+        };
+        let mut state = RenderState::new();
+        state.frame_pending = true;
+        state.retry_at = Some(Instant::now());
+        state.reset_after_detach(key);
+        assert_eq!(state.render_key, Some(key));
+        assert!(!state.dirty);
+        assert!(!state.frame_pending);
+        assert!(state.retry_at.is_none());
+    }
+
+    #[test]
+    fn key_changes_reset_the_pool() {
+        let key = RenderKey {
+            width: 1,
+            height: 1,
+            scale: 1,
+        };
+        assert!(!needs_pool_reset(None, key));
+        assert!(!needs_pool_reset(Some(key), key));
+        assert!(needs_pool_reset(Some(RenderKey { width: 2, ..key }), key));
+    }
+
+    #[test]
+    fn idle_static_and_non_fading_blink_do_not_request_frames() {
+        let frame = TimerFrame {
+            started_ns: 0,
+            deadline_ns: 10_000_000_000,
+            now_ns: 5_000_000_000,
+        };
+        assert!(!needs_frame_callback(Animation::Static, false, frame));
+        assert!(!needs_frame_callback(Animation::Blink, false, frame));
+        assert!(needs_frame_callback(Animation::Expand, false, frame));
+        assert!(needs_frame_callback(
+            Animation::Static,
+            true,
+            TimerFrame { now_ns: 1, ..frame }
+        ));
+    }
+}

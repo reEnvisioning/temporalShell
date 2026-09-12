@@ -14,6 +14,7 @@ const MAX_ENTRY_BYTES: u64 = 21;
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const AUTO_ID_LENGTH: usize = 8;
 const AUTO_ID_ATTEMPTS: usize = 100;
+const MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug)]
 pub(crate) enum Error {
@@ -24,6 +25,67 @@ pub(crate) enum Error {
 pub(crate) fn run(command: &crate::cli::TimerCommand) -> Result<String, Error> {
     let base = state_base().map_err(Error::Runtime)?;
     run_at(&base, command)
+}
+
+pub(crate) fn snapshot() -> Result<Vec<i128>, String> {
+    snapshot_at(&state_base()?)
+}
+
+fn snapshot_at(base: &Path) -> Result<Vec<i128>, String> {
+    let owner = base.join("reEnvisioning");
+    let shell = owner.join("temporalShell");
+    let timers = shell.join("timers");
+    for (path, private) in [
+        (base, false),
+        (owner.as_path(), true),
+        (shell.as_path(), true),
+    ] {
+        match readable_directory(path, private)? {
+            Some(()) => {}
+            None => return Ok(Vec::new()),
+        }
+    }
+    match readable_directory(&timers, true)? {
+        Some(()) => {
+            let entries = entries(&timers)?;
+            #[cfg(unix)]
+            for entry in &entries {
+                let path = timers.join(&entry.id);
+                if fs::symlink_metadata(&path)
+                    .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+                    .permissions()
+                    .mode()
+                    & 0o077
+                    != 0
+                {
+                    return Err(format!("{} must be private", path.display()));
+                }
+            }
+            let mut deadlines: Vec<_> = entries
+                .into_iter()
+                .map(|entry| parse_date(&entry.date).map(|date| date.unix_timestamp_nanos()))
+                .collect::<Result<_, _>>()?;
+            deadlines.sort_unstable();
+            Ok(deadlines)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+fn readable_directory(path: &Path, private: bool) -> Result<Option<()>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{} must be a directory", path.display()));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & if private { 0o077 } else { 0o022 } != 0 {
+        return Err(format!("{} has unsafe permissions", path.display()));
+    }
+    Ok(Some(()))
 }
 
 fn run_at(base: &Path, command: &crate::cli::TimerCommand) -> Result<String, Error> {
@@ -294,9 +356,16 @@ fn entries(timers: &Path) -> Result<Vec<Entry>, String> {
         Err(error) => return Err(format!("cannot inspect {}: {error}", timers.display())),
     }
     let mut entries = Vec::new();
-    for item in fs::read_dir(timers)
+    for (index, item) in fs::read_dir(timers)
         .map_err(|error| format!("cannot read {}: {error}", timers.display()))?
+        .enumerate()
     {
+        if index >= MAX_ENTRIES {
+            return Err(format!(
+                "{} contains more than {MAX_ENTRIES} entries",
+                timers.display()
+            ));
+        }
         let item = item.map_err(|error| format!("cannot read {}: {error}", timers.display()))?;
         let name = item.file_name();
         let name = name
@@ -523,7 +592,7 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_duration(value: &str) -> Result<i64, String> {
+pub(crate) fn parse_duration(value: &str) -> Result<i64, String> {
     if value.is_empty() {
         return Err("duration must use descending positive d/h/m/s components".into());
     }
@@ -849,6 +918,70 @@ mod tests {
             fs::metadata(outside).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_is_read_only_bounded_and_validated() {
+        let base = base();
+        fs::remove_dir(&base).unwrap();
+        assert!(snapshot_at(&base).unwrap().is_empty());
+        assert!(!base.exists());
+
+        fs::create_dir(&base).unwrap();
+        let owner = base.join("reEnvisioning");
+        let shell = owner.join("temporalShell");
+        let timers = shell.join("timers");
+        private_directory(&owner).unwrap();
+        private_directory(&shell).unwrap();
+        private_directory(&timers).unwrap();
+        fs::write(timers.join("one"), "2096-02-29T12:34:56Z\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(timers.join("one"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(snapshot_at(&base).unwrap().len(), 1);
+        assert!(!shell.join(".timers.lock").exists());
+        #[cfg(unix)]
+        fs::set_permissions(timers.join("one"), fs::Permissions::from_mode(0o644)).unwrap();
+        #[cfg(unix)]
+        assert!(snapshot_at(&base).is_err());
+        #[cfg(unix)]
+        fs::set_permissions(timers.join("one"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(timers.join("bad"), vec![b'x'; MAX_ENTRY_BYTES as usize + 1]).unwrap();
+        assert!(snapshot_at(&base).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn snapshot_caps_directory_entries() {
+        let base = base();
+        let owner = base.join("reEnvisioning");
+        let shell = owner.join("temporalShell");
+        let timers = shell.join("timers");
+        private_directory(&owner).unwrap();
+        private_directory(&shell).unwrap();
+        private_directory(&timers).unwrap();
+        for index in 0..=MAX_ENTRIES {
+            fs::write(timers.join(format!("t{index}")), "2096-02-29T12:34:56Z\n").unwrap();
+        }
+        assert!(snapshot_at(&base).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_symlinked_timer() {
+        use std::os::unix::fs::symlink;
+        let base = base();
+        let owner = base.join("reEnvisioning");
+        let shell = owner.join("temporalShell");
+        let timers = shell.join("timers");
+        private_directory(&owner).unwrap();
+        private_directory(&shell).unwrap();
+        private_directory(&timers).unwrap();
+        let outside = base.join("outside");
+        fs::write(&outside, "2096-02-29T12:34:56Z\n").unwrap();
+        symlink(&outside, timers.join("one")).unwrap();
+        assert!(snapshot_at(&base).is_err());
         fs::remove_dir_all(base).unwrap();
     }
 

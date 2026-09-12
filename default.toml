@@ -1,0 +1,15 @@
+border_thickness_px = 10
+corner_radius_px = 0
+shadow_strength_percent = 35
+shadow_color = "#B8A890"
+border_color = "#000000"
+
+[timer]
+edge = "bottom"
+start = "0%"
+end = "100%"
+thickness_px = 3
+duration = "10s"
+animation = "expand"
+fade = true
+color = "#B8A890"

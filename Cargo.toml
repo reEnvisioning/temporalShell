@@ -21,3 +21,4 @@ time = { version = "0.3", default-features = false, features = ["formatting", "p
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit = { version = "0.19", default-features = false }
 wayland-client = "0.31"
+rustix = { version = "1", features = ["event"] }
