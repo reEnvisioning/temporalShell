@@ -11,6 +11,6 @@ rustPlatform.buildRustPackage {
     description = "Capability-based Wayland border";
     license = lib.licenses.mit;
     homepage = "https://github.com/reEnvisioning/temporalShell";
-    mainProgram = "temporalShell";
+    mainProgram = "temporalshell";
   };
 }

@@ -33,7 +33,10 @@ use wayland_client::{
     Connection, EventQueue, QueueHandle,
 };
 
-use crate::core::{buffer_dimensions, paint, timer_frame, Animation, Config, TimerFrame};
+use crate::{
+    core::{buffer_dimensions, paint_highlights, Animation, Config, TimerFrame},
+    timer::ActiveHighlight,
+};
 
 const RELOAD_INTERVAL: Duration = Duration::from_millis(250);
 const BLINK_INTERVAL_NS: i128 = 250_000_000;
@@ -114,14 +117,17 @@ struct App {
     shm: Shm,
     layer_shell: LayerShell,
     config: Config,
-    deadlines: Vec<i128>,
+    shell_started_ns: i128,
+    timer_highlights: Vec<ActiveHighlight>,
+    trigger_highlights: Vec<ActiveHighlight>,
     outputs: Vec<OutputBorder>,
     error: Option<String>,
     config_diagnostic: Option<String>,
     timer_diagnostic: Option<String>,
+    trigger_diagnostic: Option<String>,
     render_diagnostic: Option<String>,
     next_reload: Instant,
-    visual_key: Option<(i128, bool, bool)>,
+    visual_key: Option<Vec<(i128, String)>>,
 }
 
 pub(crate) enum RunError {
@@ -133,11 +139,18 @@ pub(crate) fn run(command: &crate::cli::Command) -> Result<(), RunError> {
     match command {
         crate::cli::Command::Shell => shell().map_err(RunError::Shell),
         crate::cli::Command::Available => available_command().map_err(RunError::Unavailable),
-        crate::cli::Command::Help | crate::cli::Command::Timer(_) => Ok(()),
+        crate::cli::Command::Help
+        | crate::cli::Command::Timer(_)
+        | crate::cli::Command::Trigger(_) => Ok(()),
     }
 }
 
-fn initialize(config: Config, deadlines: Vec<i128>) -> Result<(EventQueue<App>, App), String> {
+fn initialize(
+    config: Config,
+    shell_started_ns: i128,
+    timer_highlights: Vec<ActiveHighlight>,
+    trigger_highlights: Vec<ActiveHighlight>,
+) -> Result<(EventQueue<App>, App), String> {
     let connection = Connection::connect_to_env()
         .map_err(|error| format!("cannot connect to a Wayland display: {error}"))?;
     let (globals, queue) = registry_queue_init(&connection)
@@ -160,11 +173,14 @@ fn initialize(config: Config, deadlines: Vec<i128>) -> Result<(EventQueue<App>, 
             shm,
             layer_shell,
             config,
-            deadlines,
+            shell_started_ns,
+            timer_highlights,
+            trigger_highlights,
             outputs: Vec::new(),
             error: None,
             config_diagnostic: None,
             timer_diagnostic: None,
+            trigger_diagnostic: None,
             render_diagnostic: None,
             next_reload: Instant::now() + RELOAD_INTERVAL,
             visual_key: None,
@@ -173,7 +189,7 @@ fn initialize(config: Config, deadlines: Vec<i128>) -> Result<(EventQueue<App>, 
 }
 
 fn available_command() -> Result<(), String> {
-    let (_, app) = initialize(Config::default(), Vec::new())?;
+    let (_, app) = initialize(Config::default(), 0, Vec::new(), Vec::new())?;
     if app.output_state.outputs().next().is_none() {
         return Err("no Wayland outputs available".into());
     }
@@ -182,7 +198,15 @@ fn available_command() -> Result<(), String> {
 }
 
 fn shell() -> Result<(), String> {
-    let (mut queue, mut app) = initialize(Config::load_or_create()?, crate::timer::snapshot()?)?;
+    let shell_started_ns = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let config = Config::load_or_create()?;
+    let timer_highlights = crate::timer::snapshot_timers(config.timer, shell_started_ns)?;
+    let (mut queue, mut app) = initialize(
+        config,
+        shell_started_ns,
+        timer_highlights,
+        crate::timer::snapshot_triggers()?,
+    )?;
     loop {
         queue
             .dispatch_pending(&mut app)
@@ -296,12 +320,15 @@ impl App {
             .position(|output| output.layer == *layer)
     }
 
-    fn current_frame(&self) -> Option<TimerFrame> {
-        timer_frame(
-            OffsetDateTime::now_utc().unix_timestamp_nanos(),
-            &self.deadlines,
-            self.config.timer.duration_seconds,
-        )
+    fn active_highlights(&self) -> Vec<ActiveHighlight> {
+        let mut highlights = self.timer_highlights.clone();
+        highlights.extend(self.trigger_highlights.clone());
+        highlights.sort_by(|left, right| {
+            left.started_ns
+                .cmp(&right.started_ns)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        highlights
     }
 
     fn redraw(&mut self, qh: &QueueHandle<Self>, index: usize) -> Result<(), String> {
@@ -317,23 +344,36 @@ impl App {
         if !self.outputs[index].state.dirty && self.outputs[index].state.render_key == Some(key) {
             return Ok(());
         }
-        if let Err(error) = self.config.validate_output(width, height) {
-            let output = &mut self.outputs[index];
-            output.layer.wl_surface().attach(None, 0, 0);
-            output.layer.commit();
-            output.state.reset_after_detach(key);
-            diagnose_once(
-                &mut self.render_diagnostic,
-                format!("timer hidden on {width}x{height} output: {error}; adjust timer start/end or use percentage bounds"),
-            );
-            return Ok(());
-        }
+        let highlights = self.active_highlights();
         self.render_diagnostic = None;
-        let frame = self.current_frame();
-        let animate = frame.is_some_and(|frame| {
-            needs_frame_callback(self.config.timer.animation, self.config.timer.fade, frame)
+        let now_ns = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let animate = highlights.iter().any(|highlight| {
+            let timer = highlight.style.unwrap_or(self.config.timer);
+            needs_frame_callback(
+                timer.animation,
+                timer.fade,
+                TimerFrame {
+                    started_ns: highlight.started_ns,
+                    deadline_ns: highlight.expires_ns,
+                    now_ns,
+                },
+            )
         });
-        let (pixel_width, pixel_height, stride, bytes) = buffer_dimensions(width, height, scale)?;
+        let (pixel_width, pixel_height, stride, bytes) =
+            match buffer_dimensions(width, height, scale) {
+                Ok(dimensions) => dimensions,
+                Err(error) => {
+                    let output = &mut self.outputs[index];
+                    output.layer.wl_surface().attach(None, 0, 0);
+                    output.layer.commit();
+                    output.state.reset_after_detach(key);
+                    diagnose_once(
+                        &mut self.render_diagnostic,
+                        format!("highlight hidden on {width}x{height} output: {error}"),
+                    );
+                    return Ok(());
+                }
+            };
         if self.outputs[index]
             .buffers
             .iter()
@@ -383,14 +423,26 @@ impl App {
         if canvas.len() < bytes {
             return Err("shared-memory buffer is smaller than requested".into());
         }
-        paint(
+        if let Err(error) = paint_highlights(
             canvas,
             pixel_width as u32,
             pixel_height as u32,
             scale as u32,
-            self.config,
-            frame,
-        )?;
+            &self.config,
+            &highlights,
+            now_ns,
+        ) {
+            output.layer.wl_surface().attach(None, 0, 0);
+            output.layer.commit();
+            output.state.reset_after_detach(key);
+            diagnose_once(
+                &mut self.render_diagnostic,
+                format!(
+                    "highlight hidden on {width}x{height} output: {error}; adjust timer start/end or use percentage bounds"
+                ),
+            );
+            return Ok(());
+        }
         if animate && !output.state.frame_pending {
             output
                 .layer
@@ -441,36 +493,46 @@ impl App {
             }
             Err(error) => diagnose_once(&mut self.config_diagnostic, error),
         }
-        match crate::timer::snapshot() {
-            Ok(deadlines) => {
+        match crate::timer::snapshot_timers(self.config.timer, self.shell_started_ns) {
+            Ok(highlights) => {
                 self.timer_diagnostic = None;
-                if deadlines != self.deadlines {
-                    self.deadlines = deadlines;
+                if highlights != self.timer_highlights {
+                    self.timer_highlights = highlights;
                     self.dirty_all();
                 }
             }
             Err(error) => diagnose_once(&mut self.timer_diagnostic, error),
         }
+        match crate::timer::snapshot_triggers() {
+            Ok(highlights) => {
+                self.trigger_diagnostic = None;
+                if highlights != self.trigger_highlights {
+                    self.trigger_highlights = highlights;
+                    self.dirty_all();
+                }
+            }
+            Err(error) => diagnose_once(&mut self.trigger_diagnostic, error),
+        }
     }
 
     fn update_visual_key(&mut self) {
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-        let key = self
-            .deadlines
-            .iter()
-            .copied()
-            .filter(|deadline| *deadline > now)
-            .min()
-            .and_then(|deadline| {
-                let start =
-                    deadline - i128::from(self.config.timer.duration_seconds) * 1_000_000_000;
-                (now >= start).then(|| {
-                    let visible = !matches!(self.config.timer.animation, Animation::Blink)
-                        || ((now - start) / BLINK_INTERVAL_NS) % 2 == 0;
-                    let fading_out = self.config.timer.fade && now >= deadline - FADE_NS;
-                    (deadline, visible, fading_out)
+        let key = Some(
+            self.active_highlights()
+                .into_iter()
+                .filter(|highlight| now < highlight.expires_ns)
+                .map(|highlight| {
+                    let timer = highlight.style.unwrap_or(self.config.timer);
+                    let phase = match timer.animation {
+                        Animation::Blink => (now - highlight.started_ns) / BLINK_INTERVAL_NS,
+                        _ if timer.fade && now - highlight.started_ns < FADE_NS => 0,
+                        _ if timer.fade && highlight.expires_ns - now <= FADE_NS => 2,
+                        _ => 1,
+                    };
+                    (highlight.started_ns, format!("{}:{phase}", highlight.id))
                 })
-            });
+                .collect(),
+        );
         if key != self.visual_key {
             self.visual_key = key;
             self.dirty_all();
@@ -492,28 +554,30 @@ impl App {
 
     fn visual_timeout(&self) -> Option<Duration> {
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-        let deadline = self
-            .deadlines
-            .iter()
-            .copied()
-            .filter(|deadline| *deadline > now)
-            .min()?;
-        let start = deadline - i128::from(self.config.timer.duration_seconds) * 1_000_000_000;
-        let delay = if now < start {
-            start - now
-        } else {
-            let remaining = deadline - now;
-            match self.config.timer.animation {
-                Animation::Blink => {
-                    (BLINK_INTERVAL_NS - (now - start) % BLINK_INTERVAL_NS).min(remaining)
-                }
-                _ if self.config.timer.fade && remaining > FADE_NS => remaining - FADE_NS,
-                _ => remaining,
-            }
-        };
-        Some(Duration::from_nanos(
-            u64::try_from(delay.max(0)).unwrap_or(u64::MAX),
-        ))
+        self.active_highlights()
+            .into_iter()
+            .filter_map(|highlight| {
+                let timer = highlight.style.unwrap_or(self.config.timer);
+                let elapsed = now - highlight.started_ns;
+                let remaining = highlight.expires_ns - now;
+                let animation_delay = match timer.animation {
+                    Animation::Blink => {
+                        Some(BLINK_INTERVAL_NS - elapsed.rem_euclid(BLINK_INTERVAL_NS))
+                    }
+                    _ if timer.fade && elapsed < FADE_NS => Some(FADE_NS - elapsed),
+                    _ if timer.fade && remaining > FADE_NS => Some(remaining - FADE_NS),
+                    _ => None,
+                };
+                [
+                    highlight.expires_ns - now,
+                    animation_delay.unwrap_or(i128::MAX),
+                ]
+                .into_iter()
+                .filter(|delay| *delay > 0)
+                .min()
+                .map(|delay| Duration::from_nanos(u64::try_from(delay).unwrap_or(u64::MAX)))
+            })
+            .min()
     }
 
     fn remove_output_for_layer(&mut self, layer: &LayerSurface) {
@@ -528,13 +592,19 @@ fn retry_timeout(retry_at: Instant, now: Instant) -> Duration {
 }
 
 fn needs_frame_callback(animation: Animation, fade: bool, frame: TimerFrame) -> bool {
+    let elapsed = frame.now_ns - frame.started_ns;
+    let remaining = frame.deadline_ns - frame.now_ns;
+    if remaining <= 0 {
+        return false;
+    }
     matches!(
         animation,
         Animation::Expand | Animation::FlowUp | Animation::FlowDown
-    ) || (fade
-        && (matches!(animation, Animation::Blink)
-            || frame.now_ns - frame.started_ns < FADE_NS
-            || frame.deadline_ns - frame.now_ns <= FADE_NS))
+    ) && elapsed < frame.deadline_ns - frame.started_ns
+        || fade
+            && (matches!(animation, Animation::Blink)
+                || elapsed < FADE_NS
+                || 0 < remaining && remaining <= FADE_NS)
 }
 
 fn diagnose_once(previous: &mut Option<String>, error: String) {
@@ -750,6 +820,22 @@ mod tests {
             Animation::Static,
             true,
             TimerFrame { now_ns: 1, ..frame }
+        ));
+        assert!(needs_frame_callback(
+            Animation::Static,
+            true,
+            TimerFrame {
+                now_ns: frame.deadline_ns - 1,
+                ..frame
+            }
+        ));
+        assert!(!needs_frame_callback(
+            Animation::Blink,
+            true,
+            TimerFrame {
+                now_ns: frame.deadline_ns,
+                ..frame
+            }
         ));
     }
 }
