@@ -10,13 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 const MAX_CONFIG_VALUE: u32 = 256;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-const MAX_HIGHLIGHTS: usize = 64;
 const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const SHADOW_WIDTH: u32 = 3;
-const SHADOW: [u32; SHADOW_WIDTH as usize] = [0x4d, 0x33, 0x1a];
-const FADE_NS: i128 = 250_000_000;
-#[cfg(test)]
-const SECOND_NS: i128 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Edge {
@@ -28,40 +22,49 @@ pub(crate) enum Edge {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Coordinate {
-    Percent(u32),
-    Pixels(u32),
+    Percent(i32),
+    Pixels(i32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Animation {
-    Expand,
-    FlowUp,
-    FlowDown,
-    Static,
-    Blink,
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AnimationConfig {
+    pixels: String,
+    curve: crate::animation::Curve,
+    expression: Option<crate::animation::Expression>,
+    mask: Option<crate::animation::Expression>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PixelConfig {
+    curve: crate::animation::Curve,
+    expression: Option<crate::animation::Expression>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TimerConfig {
     pub(crate) edge: Edge,
     pub(crate) start: Coordinate,
     pub(crate) end: Coordinate,
-    pub(crate) thickness_px: u32,
     pub(crate) duration_seconds: i64,
-    pub(crate) animation: Animation,
-    pub(crate) fade: bool,
+    pub(crate) animation: String,
     pub(crate) color: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Config {
     pub(crate) border_thickness_px: u32,
+    pub(crate) highlight_thickness_px: u32,
     pub(crate) corner_radius_px: u32,
+    pub(crate) shadow_width_px: u32,
+    pub(crate) shadow_peak_opacity_percent: u32,
     pub(crate) shadow_strength_percent: u32,
     pub(crate) shadow_color: u32,
     pub(crate) border_color: u32,
     pub(crate) timer: TimerConfig,
+    highlight_default: TimerConfig,
     highlights: Vec<(String, TimerConfig)>,
+    animations: Vec<(String, AnimationConfig)>,
+    pixels: Vec<(String, PixelConfig)>,
 }
 
 const DEFAULT_CONFIG: &str = include_str!("../default.toml");
@@ -82,18 +85,64 @@ impl Config {
         load_or_create_at(&config_path()?)
     }
 
+    pub(crate) fn default_highlight(&self) -> TimerConfig {
+        self.highlight_default.clone()
+    }
+
+    pub(crate) fn has_animation(&self, name: &str) -> bool {
+        self.animation(name).is_some()
+    }
+
+    fn animation(&self, name: &str) -> Option<&AnimationConfig> {
+        self.animations
+            .iter()
+            .find(|(item, _)| item == name)
+            .map(|(_, item)| item)
+    }
+
+    fn pixels(&self, name: &str) -> Option<&PixelConfig> {
+        self.pixels
+            .iter()
+            .find(|(item, _)| item == name)
+            .map(|(_, item)| item)
+    }
+
+    pub(crate) fn animation_changes(&self, style: &TimerConfig) -> bool {
+        self.animation(&style.animation).is_some_and(|animation| {
+            animation.curve.continuous()
+                || animation
+                    .expression
+                    .as_ref()
+                    .is_some_and(|value| value.uses_time())
+                || animation
+                    .mask
+                    .as_ref()
+                    .is_some_and(|value| value.uses_time())
+                || self.pixels(&animation.pixels).is_some_and(|pixels| {
+                    pixels.curve.continuous()
+                        || pixels
+                            .expression
+                            .as_ref()
+                            .is_some_and(|value| value.uses_time())
+                })
+        })
+    }
+
     pub(crate) fn named_style(&self, name: &str) -> Option<TimerConfig> {
         self.highlights
             .iter()
             .find(|(item, _)| item == name)
-            .map(|(_, style)| *style)
+            .map(|(_, style)| style.clone())
     }
 }
 
 fn empty_config() -> Config {
     Config {
         border_thickness_px: 0,
+        highlight_thickness_px: 0,
         corner_radius_px: 0,
+        shadow_width_px: 0,
+        shadow_peak_opacity_percent: 0,
         shadow_strength_percent: 0,
         shadow_color: 0,
         border_color: 0,
@@ -101,13 +150,21 @@ fn empty_config() -> Config {
             edge: Edge::Top,
             start: Coordinate::Percent(0),
             end: Coordinate::Percent(0),
-            thickness_px: 0,
             duration_seconds: 0,
-            animation: Animation::Static,
-            fade: false,
+            animation: String::new(),
+            color: 0,
+        },
+        highlight_default: TimerConfig {
+            edge: Edge::Top,
+            start: Coordinate::Percent(0),
+            end: Coordinate::Percent(0),
+            duration_seconds: 0,
+            animation: String::new(),
             color: 0,
         },
         highlights: Vec::new(),
+        animations: Vec::new(),
+        pixels: Vec::new(),
     }
 }
 
@@ -240,7 +297,7 @@ fn config_path() -> Result<PathBuf, String> {
         )?
         .join(".config"),
     };
-    Ok(base.join("reEnvisioning/temporalShell/config.toml"))
+    Ok(base.join("temporalshell/config.toml"))
 }
 
 fn absolute_path(name: &str, value: std::ffi::OsString) -> Result<PathBuf, String> {
@@ -252,19 +309,56 @@ fn absolute_path(name: &str, value: std::ffi::OsString) -> Result<PathBuf, Strin
 }
 
 fn parse_config(text: &str) -> Result<Config, String> {
-    parse_config_over(text, Config::default())
+    parse_config_over(
+        text,
+        if text == DEFAULT_CONFIG {
+            empty_config()
+        } else {
+            Config::default()
+        },
+    )
 }
 
 fn parse_config_over(text: &str, mut config: Config) -> Result<Config, String> {
     enum Table {
         Root,
-        Timer,
+        Timer(TimerConfig, Vec<String>),
+        Default(TimerConfig, Vec<String>),
         Highlight(String, TimerConfig, Vec<String>),
+        Animation(String, AnimationConfig, Vec<String>),
+        Pixel(String, PixelConfig, Vec<String>),
     }
+    let require_complete_default = config.border_thickness_px == 0;
     let mut table = Table::Root;
     let mut seen_root = Vec::new();
-    let mut seen_timer = Vec::new();
-    let mut alias = false;
+    let mut seen_timer = false;
+    let mut seen_default = false;
+    let mut named_started = false;
+    let mut seen_animations = Vec::new();
+    let mut seen_pixels = Vec::new();
+
+    macro_rules! finish_table {
+        ($line:expr) => {
+            match &table {
+                Table::Root => {}
+                Table::Timer(style, _) => config.timer = style.clone(),
+                Table::Default(style, seen) => {
+                    if require_complete_default {
+                        complete_style(seen, $line)?;
+                    }
+                    config.highlight_default = style.clone();
+                }
+                Table::Highlight(name, style, _) => {
+                    config.highlights.push((name.clone(), style.clone()))
+                }
+                Table::Animation(name, animation, _) => {
+                    config.animations.push((name.clone(), animation.clone()))
+                }
+                Table::Pixel(name, pixels, _) => config.pixels.push((name.clone(), pixels.clone())),
+            }
+        };
+    }
+
     for (index, raw) in text.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_comment(raw, line_number)?.trim();
@@ -272,25 +366,73 @@ fn parse_config_over(text: &str, mut config: Config) -> Result<Config, String> {
             continue;
         }
         if line.starts_with('[') {
-            if let Table::Highlight(name, style, seen) = &table {
-                complete_style(style, seen, line_number)?;
-                config.highlights.push((name.clone(), *style));
-            }
-            table = if line == "[timer]" && seen_timer.is_empty() && config.highlights.is_empty() {
-                Table::Timer
+            finish_table!(line_number);
+            table = if line == "[timer]" && !seen_timer && !seen_default && !named_started {
+                seen_timer = true;
+                Table::Timer(config.timer.clone(), Vec::new())
+            } else if line == "[highlight.default]" && !seen_default && !named_started {
+                seen_default = true;
+                Table::Default(config.highlight_default.clone(), Vec::new())
+            } else if let Some(name) = line
+                .strip_prefix("[animation.")
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                if validate_highlight_name(name).is_err()
+                    || seen_animations.iter().any(|item| item == name)
+                {
+                    return Err(format!("line {line_number}: unknown or duplicate table"));
+                }
+                seen_animations.push(name.to_owned());
+                let animation = config
+                    .animations
+                    .iter()
+                    .find(|(item, _)| item == name)
+                    .map(|(_, item)| item.clone())
+                    .unwrap_or(AnimationConfig {
+                        pixels: String::new(),
+                        curve: crate::animation::constant(),
+                        expression: None,
+                        mask: None,
+                    });
+                config.animations.retain(|(item, _)| item != name);
+                Table::Animation(name.to_owned(), animation, Vec::new())
+            } else if let Some(name) = line
+                .strip_prefix("[pixel.")
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                if validate_highlight_name(name).is_err()
+                    || seen_pixels.iter().any(|item| item == name)
+                {
+                    return Err(format!("line {line_number}: unknown or duplicate table"));
+                }
+                seen_pixels.push(name.to_owned());
+                let pixels = config
+                    .pixels
+                    .iter()
+                    .find(|(item, _)| item == name)
+                    .map(|(_, item)| item.clone())
+                    .unwrap_or(PixelConfig {
+                        curve: crate::animation::constant(),
+                        expression: None,
+                    });
+                config.pixels.retain(|(item, _)| item != name);
+                Table::Pixel(name.to_owned(), pixels, Vec::new())
             } else if let Some(name) = line
                 .strip_prefix("[highlight.")
                 .and_then(|value| value.strip_suffix(']'))
             {
                 if validate_highlight_name(name).is_err()
                     || name == "default"
-                    || config.highlights.len() >= MAX_HIGHLIGHTS
                     || config.named_style(name).is_some()
-                    || matches!(&table, Table::Highlight(old, _, _) if old == name)
                 {
                     return Err(format!("line {line_number}: unknown or duplicate table"));
                 }
-                Table::Highlight(name.to_owned(), empty_config().timer, Vec::new())
+                named_started = true;
+                Table::Highlight(
+                    name.to_owned(),
+                    config.highlight_default.clone(),
+                    Vec::new(),
+                )
             } else {
                 return Err(format!("line {line_number}: unknown or duplicate table"));
             };
@@ -314,9 +456,8 @@ fn parse_config_over(text: &str, mut config: Config) -> Result<Config, String> {
                     "border_thickness_px" => {
                         config.border_thickness_px = positive_integer(value, key, line_number)?
                     }
-                    "event_line_thickness_px" => {
-                        alias = true;
-                        config.timer.thickness_px = positive_integer(value, key, line_number)?;
+                    "highlight_thickness_px" => {
+                        config.highlight_thickness_px = positive_integer(value, key, line_number)?
                     }
                     "corner_radius_px" => {
                         config.corner_radius_px = integer(value, key, line_number)?;
@@ -326,47 +467,112 @@ fn parse_config_over(text: &str, mut config: Config) -> Result<Config, String> {
                             ));
                         }
                     }
+                    "shadow_width_px" => {
+                        config.shadow_width_px = positive_integer(value, key, line_number)?
+                    }
+                    "shadow_peak_opacity_percent" => {
+                        config.shadow_peak_opacity_percent = percent(value, key, line_number)?
+                    }
                     "shadow_strength_percent" => {
-                        config.shadow_strength_percent = integer(value, key, line_number)?;
-                        if config.shadow_strength_percent > 100 {
-                            return Err(format!(
-                                "line {line_number}: {key} must be between 0 and 100"
-                            ));
-                        }
+                        config.shadow_strength_percent = percent(value, key, line_number)?
                     }
                     "shadow_color" => config.shadow_color = color(value, key, line_number)?,
                     "border_color" => config.border_color = color(value, key, line_number)?,
                     _ => return Err(format!("line {line_number}: unknown root key {key}")),
                 }
             }
-            Table::Timer => {
-                if seen_timer.iter().any(|item| item == key) {
-                    return Err(format!("line {line_number}: duplicate key {key}"));
-                }
-                if alias && key == "thickness_px" {
-                    return Err(
-                        "event_line_thickness_px and timer.thickness_px cannot both be set".into(),
-                    );
-                }
-                seen_timer.push(key.to_owned());
-                apply_style_key(&mut config.timer, key, value, line_number)?;
-            }
-            Table::Highlight(_, style, seen) => {
+            Table::Timer(style, seen)
+            | Table::Default(style, seen)
+            | Table::Highlight(_, style, seen) => {
                 if seen.iter().any(|item| item == key) {
                     return Err(format!("line {line_number}: duplicate key {key}"));
                 }
                 seen.push(key.to_owned());
                 apply_style_key(style, key, value, line_number)?;
             }
+            Table::Animation(_, animation, seen) => {
+                if seen.iter().any(|item| item == key) {
+                    return Err(format!("line {line_number}: duplicate key {key}"));
+                }
+                seen.push(key.to_owned());
+                match key {
+                    "pixels" => animation.pixels = quoted(value, key, line_number)?.to_owned(),
+                    "keyframes" => {
+                        animation.curve =
+                            crate::animation::curve(value, Some(animation.curve.interpolation))
+                                .map_err(|error| format!("line {line_number}: {error}"))?
+                    }
+                    "interpolation" => {
+                        animation.curve.interpolation =
+                            crate::animation::interpolation(quoted(value, key, line_number)?)
+                                .map_err(|error| format!("line {line_number}: {error}"))?
+                    }
+                    "expression" => {
+                        animation.expression = Some(
+                            crate::animation::expression(quoted(value, key, line_number)?)
+                                .map_err(|error| format!("line {line_number}: {error}"))?,
+                        )
+                    }
+                    "mask" => {
+                        animation.mask = Some(
+                            crate::animation::expression(quoted(value, key, line_number)?)
+                                .map_err(|error| format!("line {line_number}: {error}"))?,
+                        )
+                    }
+                    _ => return Err(format!("line {line_number}: unknown animation key {key}")),
+                }
+            }
+            Table::Pixel(_, pixels, seen) => {
+                if seen.iter().any(|item| item == key) {
+                    return Err(format!("line {line_number}: duplicate key {key}"));
+                }
+                seen.push(key.to_owned());
+                match key {
+                    "keyframes" => {
+                        pixels.curve =
+                            crate::animation::curve(value, Some(pixels.curve.interpolation))
+                                .map_err(|error| format!("line {line_number}: {error}"))?
+                    }
+                    "interpolation" => {
+                        pixels.curve.interpolation =
+                            crate::animation::interpolation(quoted(value, key, line_number)?)
+                                .map_err(|error| format!("line {line_number}: {error}"))?
+                    }
+                    "expression" => {
+                        pixels.expression = Some(
+                            crate::animation::expression(quoted(value, key, line_number)?)
+                                .map_err(|error| format!("line {line_number}: {error}"))?,
+                        )
+                    }
+                    _ => return Err(format!("line {line_number}: unknown pixel key {key}")),
+                }
+            }
         }
     }
-    if let Table::Highlight(name, style, seen) = table {
-        complete_style(&style, &seen, text.lines().count() + 1)?;
-        config.highlights.push((name, style));
+    finish_table!(text.lines().count() + 1);
+    if config.highlight_thickness_px == 0
+        || config.highlight_thickness_px > config.border_thickness_px
+    {
+        return Err("highlight_thickness_px must be between 1 and border_thickness_px".into());
     }
-    validate_style(config.timer, config.border_thickness_px)?;
+    if config.shadow_width_px == 0 {
+        return Err("shadow_width_px must be positive".into());
+    }
+    validate_style(&config.timer)?;
+    validate_style(&config.highlight_default)?;
     for (_, style) in &config.highlights {
-        validate_style(*style, config.border_thickness_px)?;
+        validate_style(style)?;
+    }
+    for style in std::iter::once(&config.timer)
+        .chain(std::iter::once(&config.highlight_default))
+        .chain(config.highlights.iter().map(|(_, style)| style))
+    {
+        let animation = config
+            .animation(&style.animation)
+            .ok_or_else(|| format!("unknown animation {}", style.animation))?;
+        if config.pixels(&animation.pixels).is_none() {
+            return Err(format!("unknown pixels {}", animation.pixels));
+        }
     }
     Ok(config)
 }
@@ -382,68 +588,44 @@ pub(crate) fn style_record(style: TimerConfig) -> String {
         Coordinate::Percent(value) => format!("{value}%"),
         Coordinate::Pixels(value) => format!("{value}px"),
     };
-    let animation = match style.animation {
-        Animation::Expand => "expand",
-        Animation::FlowUp => "flow-up",
-        Animation::FlowDown => "flow-down",
-        Animation::Static => "static",
-        Animation::Blink => "blink",
-    };
     format!(
-        "{edge}\t{}\t{}\t{}\t{}s\t{animation}\t{}\t#{:06x}",
+        "{edge}\t{}\t{}\t{}s\t{}\t#{:06x}",
         coordinate(style.start),
         coordinate(style.end),
-        style.thickness_px,
         style.duration_seconds,
-        style.fade,
+        style.animation,
         style.color
     )
 }
 
 pub(crate) fn style_from_record(fields: &[&str]) -> Result<TimerConfig, String> {
-    let [edge, start, end, thickness_px, duration, animation, fade, color_text] = fields else {
+    let [edge, start, end, duration, animation, color] = fields else {
         return Err("trigger style fields".into());
     };
-    let edge = match *edge {
-        "top" => Edge::Top,
-        "right" => Edge::Right,
-        "bottom" => Edge::Bottom,
-        "left" => Edge::Left,
-        _ => return Err("trigger style edge".into()),
-    };
-    let start = coordinate(&format!("\"{start}\""), "start", 0)?;
-    let end = coordinate(&format!("\"{end}\""), "end", 0)?;
-    let thickness_px = positive_integer(thickness_px, "thickness_px", 0)?;
-    let duration_seconds = crate::timer::parse_duration(duration)?;
-    if duration_seconds > 86_400 {
-        return Err("trigger style duration".into());
+    let mut style = empty_config().timer;
+    for (key, value) in [
+        ("edge", *edge),
+        ("start", *start),
+        ("end", *end),
+        ("duration", *duration),
+        ("animation", *animation),
+        ("color", *color),
+    ] {
+        apply_trigger_option(&mut style, key, value)?;
     }
-    let animation = match *animation {
-        "expand" => Animation::Expand,
-        "flow-up" => Animation::FlowUp,
-        "flow-down" => Animation::FlowDown,
-        "static" => Animation::Static,
-        "blink" => Animation::Blink,
-        _ => return Err("trigger style animation".into()),
-    };
-    let fade = match *fade {
-        "true" => true,
-        "false" => false,
-        _ => return Err("trigger style fade".into()),
-    };
-    let color = color(&format!("\"{color_text}\""), "color", 0)?;
-    let style = TimerConfig {
-        edge,
-        start,
-        end,
-        thickness_px,
-        duration_seconds,
-        animation,
-        fade,
-        color,
-    };
-    validate_style(style, MAX_CONFIG_VALUE)?;
+    validate_style(&style)?;
     Ok(style)
+}
+
+pub(crate) fn apply_trigger_option(
+    style: &mut TimerConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let quoted_value = format!("\"{value}\"");
+    let value = &quoted_value;
+    apply_style_key(style, key, value, 0)
+        .map_err(|error| error.strip_prefix("line 0: ").unwrap_or(&error).to_owned())
 }
 
 fn validate_highlight_name(name: &str) -> Result<(), ()> {
@@ -460,22 +642,12 @@ fn validate_highlight_name(name: &str) -> Result<(), ()> {
     }
 }
 
-fn complete_style(style: &TimerConfig, seen: &[String], line: usize) -> Result<(), String> {
-    for key in [
-        "edge",
-        "start",
-        "end",
-        "thickness_px",
-        "duration",
-        "animation",
-        "fade",
-        "color",
-    ] {
+fn complete_style(seen: &[String], line: usize) -> Result<(), String> {
+    for key in ["edge", "start", "end", "duration", "animation", "color"] {
         if !seen.iter().any(|item| item == key) {
-            return Err(format!("line {line}: highlight table must contain {key}"));
+            return Err(format!("line {line}: highlight.default must contain {key}"));
         }
     }
-    let _ = style;
     Ok(())
 }
 
@@ -492,50 +664,37 @@ fn apply_style_key(
                 "right" => Edge::Right,
                 "bottom" => Edge::Bottom,
                 "left" => Edge::Left,
-                _ => return Err(format!("line {line}: invalid timer edge")),
+                _ => return Err(format!("line {line}: invalid highlight edge")),
             }
         }
         "start" => style.start = coordinate(value, key, line)?,
         "end" => style.end = coordinate(value, key, line)?,
-        "thickness_px" => style.thickness_px = positive_integer(value, key, line)?,
         "duration" => {
             let seconds = crate::timer::parse_duration(quoted(value, key, line)?)?;
             if seconds > 86_400 {
-                return Err(format!("line {line}: timer duration must not exceed 1d"));
+                return Err(format!(
+                    "line {line}: highlight duration must not exceed 1d"
+                ));
             }
             style.duration_seconds = seconds;
         }
-        "animation" => {
-            style.animation = match quoted(value, key, line)? {
-                "expand" => Animation::Expand,
-                "flow-up" => Animation::FlowUp,
-                "flow-down" => Animation::FlowDown,
-                "static" => Animation::Static,
-                "blink" => Animation::Blink,
-                _ => return Err(format!("line {line}: invalid timer animation")),
-            }
-        }
-        "fade" => {
-            style.fade = match value {
-                "true" => true,
-                "false" => false,
-                _ => return Err(format!("line {line}: timer fade must be true or false")),
-            }
-        }
+        "animation" => style.animation = quoted(value, key, line)?.to_owned(),
         "color" => style.color = color(value, key, line)?,
-        _ => return Err(format!("line {line}: unknown timer key {key}")),
+        _ => return Err(format!("line {line}: unknown highlight key {key}")),
     };
     Ok(())
 }
 
-fn validate_style(style: TimerConfig, thickness: u32) -> Result<(), String> {
-    if style.thickness_px > thickness {
-        return Err("timer.thickness_px must be between 1 and border_thickness_px".into());
-    }
-    if matches!(style.animation, Animation::FlowUp | Animation::FlowDown)
-        && matches!(style.edge, Edge::Top | Edge::Bottom)
-    {
-        return Err("flow-up and flow-down require timer edge left or right".into());
+pub(crate) fn validate_style(style: &TimerConfig) -> Result<(), String> {
+    validate_highlight_name(&style.animation)
+        .map_err(|_| "invalid highlight animation".to_owned())?;
+    if matches!(
+        (style.start, style.end),
+        (Coordinate::Percent(start), Coordinate::Percent(end))
+            | (Coordinate::Pixels(start), Coordinate::Pixels(end))
+            if start >= end
+    ) {
+        return Err("highlight start must be less than end".into());
     }
     Ok(())
 }
@@ -583,6 +742,14 @@ fn positive_integer(value: &str, key: &str, line: usize) -> Result<u32, String> 
     Ok(number)
 }
 
+fn percent(value: &str, key: &str, line: usize) -> Result<u32, String> {
+    let number = integer(value, key, line)?;
+    if number > 100 {
+        return Err(format!("line {line}: {key} must be between 0 and 100"));
+    }
+    Ok(number)
+}
+
 fn color(value: &str, key: &str, line: usize) -> Result<u32, String> {
     let value = quoted(value, key, line)?;
     if value.len() != 7
@@ -597,17 +764,26 @@ fn color(value: &str, key: &str, line: usize) -> Result<u32, String> {
 fn coordinate(value: &str, key: &str, line: usize) -> Result<Coordinate, String> {
     let value = quoted(value, key, line)?;
     if let Some(digits) = value.strip_suffix('%') {
-        let number = integer(digits, key, line)?;
-        if number <= 100 {
+        let number = signed_integer(digits, key, line)?;
+        if (-100..=200).contains(&number) {
             return Ok(Coordinate::Percent(number));
         }
     } else if let Some(digits) = value.strip_suffix("px") {
-        let number = integer(digits, key, line)?;
-        return Ok(Coordinate::Pixels(number));
+        return Ok(Coordinate::Pixels(signed_integer(digits, key, line)?));
     }
     Err(format!(
-        "line {line}: {key} must be exactly N% (0..100) or nonnegative Npx"
+        "line {line}: {key} must be -100%..200% or a signed pixel bound"
     ))
+}
+
+fn signed_integer(value: &str, key: &str, line: usize) -> Result<i32, String> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("line {line}: {key} must be an integer"));
+    }
+    value
+        .parse()
+        .map_err(|_| format!("line {line}: {key} is out of range"))
 }
 
 pub(crate) fn buffer_dimensions(
@@ -640,25 +816,6 @@ pub(crate) struct TimerFrame {
     pub(crate) now_ns: i128,
 }
 
-#[cfg(test)]
-pub(crate) fn paint(
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
-    scale: u32,
-    config: &Config,
-    timer: Option<TimerFrame>,
-) -> Result<(), String> {
-    paint_frames(
-        canvas,
-        width,
-        height,
-        scale,
-        config,
-        timer.map(|frame| (config.timer, frame)).into_iter(),
-    )
-}
-
 pub(crate) fn paint_highlights(
     canvas: &mut [u8],
     width: u32,
@@ -678,7 +835,10 @@ pub(crate) fn paint_highlights(
             .iter()
             .filter(|highlight| now_ns < highlight.expires_ns)
             .map(|highlight| {
-                let timer = highlight.style.unwrap_or(config.timer);
+                let timer = highlight
+                    .style
+                    .clone()
+                    .unwrap_or_else(|| config.timer.clone());
                 (
                     timer,
                     TimerFrame {
@@ -703,9 +863,19 @@ fn paint_frames(
     let logical_height = height / scale;
     let frames: Vec<_> = frames
         .filter_map(|(timer, frame)| {
-            timer_bounds(timer, logical_width, logical_height)
-                .ok()
-                .map(|bounds| (timer, bounds, frame))
+            timer_bounds(
+                timer.clone(),
+                logical_width,
+                logical_height,
+                if config.corner_radius_px == 0 {
+                    0
+                } else {
+                    config.border_thickness_px + config.corner_radius_px
+                },
+                config.highlight_thickness_px,
+            )
+            .ok()
+            .map(|bounds| (timer, bounds, frame))
         })
         .collect();
     for (pixel, chunk) in canvas
@@ -716,9 +886,11 @@ fn paint_frames(
         let x = (pixel as u32 % width) / scale;
         let y = (pixel as u32 / width) / scale;
         let mut value = frame_pixel(x, y, logical_width, logical_height, config);
-        for (timer, bounds, frame) in &frames {
-            if let Some(blend) = timer_pixel(x, y, *timer, *bounds, *frame) {
-                value = opaque_mix(value & 0x00ff_ffff, timer.color, blend);
+        if could_hit_highlight(x, y, logical_width, logical_height, config) {
+            for (timer, bounds, frame) in &frames {
+                if let Some(blend) = timer_pixel(x, y, timer, *bounds, *frame, config) {
+                    value = opaque_mix(value & 0x00ff_ffff, timer.color, blend);
+                }
             }
         }
         chunk.copy_from_slice(&value.to_le_bytes());
@@ -726,118 +898,248 @@ fn paint_frames(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct Bounds {
-    start: u32,
-    end: u32,
-    width: u32,
-    height: u32,
+fn could_hit_highlight(x: u32, y: u32, width: u32, height: u32, config: &Config) -> bool {
+    let near_edge = x.min(width - 1 - x).min(y.min(height - 1 - y));
+    if near_edge < config.highlight_thickness_px {
+        return true;
+    }
+    if config.corner_radius_px == 0 {
+        return false;
+    }
+    let radius = config.border_thickness_px + config.corner_radius_px;
+    (x < radius || x >= width.saturating_sub(radius))
+        && (y < radius || y >= height.saturating_sub(radius))
 }
 
-fn timer_bounds(timer: TimerConfig, width: u32, height: u32) -> Result<Bounds, String> {
-    let length = if matches!(timer.edge, Edge::Top | Edge::Bottom) {
-        width
-    } else {
-        height
-    };
-    if timer.thickness_px
-        > if matches!(timer.edge, Edge::Top | Edge::Bottom) {
-            height
-        } else {
-            width
-        }
-    {
-        return Err("timer thickness exceeds output bounds".into());
+#[derive(Clone, Copy)]
+struct Bounds {
+    start: i64,
+    end: i64,
+    perimeter: i64,
+    anchor: i64,
+    forward: bool,
+    width: u32,
+    height: u32,
+    radius: u32,
+    thickness: u32,
+}
+
+fn timer_bounds(
+    timer: TimerConfig,
+    width: u32,
+    height: u32,
+    radius: u32,
+    thickness: u32,
+) -> Result<Bounds, String> {
+    if width == 0 || height == 0 || thickness > width.min(height) {
+        return Err("highlight thickness exceeds output bounds".into());
     }
-    let resolve = |coordinate| match coordinate {
-        Coordinate::Percent(value) => (u64::from(length) * u64::from(value) / 100) as u32,
-        Coordinate::Pixels(value) => value,
+    if radius != 0 && (radius >= width / 2 || radius >= height / 2) {
+        return Err("rounded highlight does not fit output".into());
+    }
+    let horizontal = i64::from(width - 2 * radius);
+    let vertical = i64::from(height - 2 * radius);
+    if horizontal == 0 || vertical == 0 {
+        return Err("rounded highlight does not fit output".into());
+    }
+    let arc = (std::f64::consts::FRAC_PI_2 * f64::from(radius)).round() as i64;
+    let (own, neighbor, anchor, forward) = match timer.edge {
+        Edge::Top => (horizontal, vertical, 0, true),
+        Edge::Right => (vertical, horizontal, horizontal + arc + vertical, false),
+        Edge::Bottom => (
+            horizontal,
+            vertical,
+            2 * horizontal + 2 * arc + vertical,
+            false,
+        ),
+        Edge::Left => (
+            vertical,
+            horizontal,
+            2 * horizontal + 3 * arc + vertical,
+            true,
+        ),
     };
-    let bounds = Bounds {
-        start: resolve(timer.start),
-        end: resolve(timer.end),
+    let resolve = |coordinate| match coordinate {
+        Coordinate::Percent(value) if value < 0 => {
+            -arc - (neighbor * i64::from(-value)).div_euclid(100)
+        }
+        Coordinate::Percent(value) if value > 100 => {
+            own + arc + (neighbor * i64::from(value - 100)).div_euclid(100)
+        }
+        Coordinate::Percent(value) => (own * i64::from(value)).div_euclid(100),
+        Coordinate::Pixels(value) => i64::from(value),
+    };
+    let start = resolve(timer.start);
+    let end = resolve(timer.end);
+    let adjacent = neighbor + arc;
+    if start >= end || start < -adjacent || end > own + adjacent {
+        return Err(
+            "highlight bounds must satisfy start < end and wrap at most one adjacent edge".into(),
+        );
+    }
+    Ok(Bounds {
+        start,
+        end,
+        perimeter: 2 * horizontal + 2 * vertical + 4 * arc,
+        anchor,
+        forward,
         width,
         height,
-    };
-    if bounds.start >= bounds.end || bounds.end > length {
-        return Err("timer rendered bounds require start < end within the output".into());
+        radius,
+        thickness,
+    })
+}
+
+fn inside_rounded(x: f64, y: f64, width: f64, height: f64, inset: f64, radius: f64) -> bool {
+    if inset * 2.0 >= width || inset * 2.0 >= height {
+        return false;
     }
-    Ok(bounds)
+    let left = inset;
+    let top = inset;
+    let right = width - inset;
+    let bottom = height - inset;
+    if x < left || x >= right || y < top || y >= bottom {
+        return false;
+    }
+    let radius = (radius - inset).max(0.0);
+    if radius == 0.0 {
+        return true;
+    }
+    let nearest_x = x.clamp(left + radius, right - radius);
+    let nearest_y = y.clamp(top + radius, bottom - radius);
+    (x - nearest_x).powi(2) + (y - nearest_y).powi(2) <= radius.powi(2)
+}
+
+fn contour_position(x: u32, y: u32, edge: Edge, bounds: Bounds, thickness: u32) -> Option<i64> {
+    let x = f64::from(x) + 0.5;
+    let y = f64::from(y) + 0.5;
+    let width = f64::from(bounds.width);
+    let height = f64::from(bounds.height);
+    let radius = f64::from(bounds.radius);
+    if !inside_rounded(x, y, width, height, 0.0, radius)
+        || inside_rounded(x, y, width, height, f64::from(thickness), radius)
+    {
+        return None;
+    }
+    if bounds.radius == 0 {
+        let distances = [y, width - x, height - y, x];
+        let minimum = distances.iter().copied().reduce(f64::min)?;
+        let selected = match edge {
+            Edge::Top => 0,
+            Edge::Right => 1,
+            Edge::Bottom => 2,
+            Edge::Left => 3,
+        };
+        let side = if distances[selected] == minimum {
+            selected
+        } else {
+            distances.iter().position(|distance| *distance == minimum)?
+        };
+        return Some(
+            match side {
+                0 => x,
+                1 => width + y,
+                2 => 2.0 * width + height - x,
+                _ => 2.0 * width + 2.0 * height - y,
+            }
+            .floor() as i64,
+        );
+    }
+    let horizontal = f64::from(bounds.width - 2 * bounds.radius);
+    let vertical = f64::from(bounds.height - 2 * bounds.radius);
+    let arc = std::f64::consts::FRAC_PI_2 * radius;
+    let position = if x < radius && y < radius {
+        let angle = (y - radius).atan2(x - radius);
+        2.0 * horizontal + 2.0 * vertical + 3.0 * arc + (angle + std::f64::consts::PI) * radius
+    } else if x >= width - radius && y < radius {
+        let angle = (y - radius).atan2(x - (width - radius));
+        horizontal + (angle + std::f64::consts::FRAC_PI_2) * radius
+    } else if x >= width - radius && y >= height - radius {
+        let angle = (y - (height - radius)).atan2(x - (width - radius));
+        horizontal + arc + vertical + angle * radius
+    } else if x < radius && y >= height - radius {
+        let angle = (y - (height - radius)).atan2(x - radius);
+        2.0 * horizontal + 2.0 * arc + vertical + (angle - std::f64::consts::FRAC_PI_2) * radius
+    } else {
+        let distances = [y, width - x, height - y, x];
+        match distances
+            .iter()
+            .enumerate()
+            .min_by(|left, right| left.1.total_cmp(right.1))?
+            .0
+        {
+            0 => x - radius,
+            1 => horizontal + arc + y - radius,
+            2 => 2.0 * horizontal + 2.0 * arc + vertical - (x - radius),
+            _ => 2.0 * horizontal + 3.0 * arc + 2.0 * vertical - (y - radius),
+        }
+    };
+    Some(position.round() as i64)
 }
 
 fn timer_pixel(
     x: u32,
     y: u32,
-    timer: TimerConfig,
+    timer: &TimerConfig,
     bounds: Bounds,
     frame: TimerFrame,
+    config: &Config,
 ) -> Option<u32> {
-    // Vertical local coordinates increase from screen bottom to top.
-    let (local, depth) = match timer.edge {
-        Edge::Top => (x, y),
-        Edge::Right => (bounds.height - 1 - y, bounds.width - 1 - x),
-        Edge::Bottom => (x, bounds.height - 1 - y),
-        Edge::Left => (bounds.height - 1 - y, x),
+    let position = contour_position(x, y, timer.edge, bounds, bounds.thickness)?;
+    let distance = if bounds.forward {
+        (position - bounds.anchor).rem_euclid(bounds.perimeter)
+    } else {
+        (bounds.anchor - position).rem_euclid(bounds.perimeter)
     };
-    if depth >= timer.thickness_px || local < bounds.start || local >= bounds.end {
+    let local = [distance, distance - bounds.perimeter]
+        .into_iter()
+        .find(|local| *local >= bounds.start && *local < bounds.end)?;
+    let duration = frame.deadline_ns - frame.started_ns;
+    if duration <= 0 {
         return None;
     }
-    let duration = frame.deadline_ns - frame.started_ns;
-    let elapsed = frame.now_ns - frame.started_ns;
-    let progress = elapsed.clamp(0, duration);
-    let length = bounds.end - bounds.start;
-    let visible = u32::try_from(i128::from(length) * progress / duration)
-        .unwrap_or(length)
-        .min(length);
-    let activation = match timer.animation {
-        Animation::Expand => {
-            let start = bounds.start + (length - visible) / 2;
-            if !(local >= start && local < start + visible) {
-                return None;
-            }
-            let position = local - bounds.start;
-            let needed = if position * 2 < length {
-                length - position * 2 - 1
-            } else {
-                position * 2 - length + 2
-            }
-            .max(1);
-            i128::from(needed) * duration / i128::from(length)
-        }
-        Animation::FlowUp => {
-            if local >= bounds.start + visible {
-                return None;
-            }
-            i128::from(local - bounds.start + 1) * duration / i128::from(length)
-        }
-        Animation::FlowDown => {
-            if local < bounds.end - visible {
-                return None;
-            }
-            i128::from(bounds.end - local) * duration / i128::from(length)
-        }
-        Animation::Static => 0,
-        Animation::Blink => {
-            let phase = elapsed % (2 * FADE_NS);
-            if !timer.fade {
-                return (phase < FADE_NS).then_some(255);
-            }
-            return Some(if phase < FADE_NS {
-                (phase * 255 / FADE_NS) as u32
-            } else {
-                ((2 * FADE_NS - phase) * 255 / FADE_NS) as u32
-            });
-        }
+    let elapsed_ns = (frame.now_ns - frame.started_ns).clamp(0, duration);
+    let progress = (elapsed_ns * crate::animation::SCALE as i128 / duration) as i64;
+    let animation = config.animation(&timer.animation)?;
+    let keyframe = animation.curve.sample(progress);
+    let position = (local - bounds.start) * crate::animation::SCALE / (bounds.end - bounds.start);
+    let seconds = |value: i128| value as f64 / 1_000_000_000.0;
+    let mut context = crate::animation::Context {
+        phase: progress as f64 / crate::animation::SCALE as f64,
+        keyframe: keyframe as f64 / crate::animation::SCALE as f64,
+        from: 0.0,
+        to: 1.0,
+        value: keyframe as f64 / crate::animation::SCALE as f64,
+        elapsed: seconds(elapsed_ns),
+        remaining: seconds(duration - elapsed_ns),
+        duration: seconds(duration),
+        position: position as f64 / crate::animation::SCALE as f64,
+        pixel: 1.0 / (bounds.end - bounds.start).max(1) as f64,
+        coverage: 1.0,
     };
-    Some(if timer.fade {
-        ((elapsed - activation)
-            .clamp(0, FADE_NS)
-            .min((frame.deadline_ns - frame.now_ns).clamp(0, FADE_NS))
-            * 255
-            / FADE_NS) as u32
-    } else {
-        255
-    })
+    if let Some(expression) = &animation.expression {
+        context.keyframe = expression.evaluate_context(context);
+        context.value = context.from + (context.to - context.from) * context.keyframe;
+    }
+    if animation
+        .mask
+        .as_ref()
+        .is_some_and(|mask| mask.evaluate_context(context) < 0.0)
+    {
+        return None;
+    }
+    let pixels = config.pixels(&animation.pixels)?;
+    let opacity = pixels
+        .curve
+        .sample((context.keyframe * crate::animation::SCALE as f64).round() as i64);
+    context.coverage = opacity as f64 / crate::animation::SCALE as f64;
+    let opacity = pixels
+        .expression
+        .as_ref()
+        .map_or(context.coverage, |expression| {
+            expression.evaluate_context(context)
+        });
+    Some((opacity.clamp(0.0, 1.0) * 255.0).round() as u32)
 }
 
 fn opaque_mix(from: u32, to: u32, amount: u32) -> u32 {
@@ -849,14 +1151,20 @@ fn opaque_mix(from: u32, to: u32, amount: u32) -> u32 {
     0xff00_0000 | mix(16) << 16 | mix(8) << 8 | mix(0)
 }
 
-fn shadow(distance: u32, strength: u32, color: u32) -> u32 {
-    let Some(&alpha) = SHADOW.get(distance as usize) else {
+fn shadow(distance: u32, config: &Config) -> u32 {
+    if distance >= config.shadow_width_px {
         return 0;
-    };
-    let alpha = (alpha * strength + 50) / 100;
-    let red = ((color >> 16) * alpha + 127) / 255;
-    let green = (((color >> 8) & 0xff) * alpha + 127) / 255;
-    let blue = ((color & 0xff) * alpha + 127) / 255;
+    }
+    let width = u64::from(config.shadow_width_px);
+    let alpha = (255
+        * u64::from(config.shadow_peak_opacity_percent)
+        * u64::from(config.shadow_width_px - distance)
+        + width * 50)
+        / (width * 100);
+    let alpha = (alpha as u32 * config.shadow_strength_percent + 50) / 100;
+    let red = ((config.shadow_color >> 16) * alpha + 127) / 255;
+    let green = (((config.shadow_color >> 8) & 0xff) * alpha + 127) / 255;
+    let blue = ((config.shadow_color & 0xff) * alpha + 127) / 255;
     alpha << 24 | red << 16 | green << 8 | blue
 }
 
@@ -873,15 +1181,11 @@ fn frame_pixel(x: u32, y: u32, width: u32, height: u32, config: &Config) -> u32 
             if distance_squared > i64::from(config.corner_radius_px).pow(2) {
                 return border;
             }
-            for distance in 0..SHADOW_WIDTH {
+            for distance in 0..config.shadow_width_px {
                 if distance_squared
                     > i64::from(config.corner_radius_px.saturating_sub(distance + 1)).pow(2)
                 {
-                    return shadow(
-                        distance,
-                        config.shadow_strength_percent,
-                        config.shadow_color,
-                    );
+                    return shadow(distance, config);
                 }
             }
             return 0;
@@ -891,11 +1195,7 @@ fn frame_pixel(x: u32, y: u32, width: u32, height: u32, config: &Config) -> u32 
     if distance < config.border_thickness_px {
         border
     } else {
-        shadow(
-            distance - config.border_thickness_px,
-            config.shadow_strength_percent,
-            config.shadow_color,
-        )
+        shadow(distance - config.border_thickness_px, config)
     }
 }
 
@@ -903,36 +1203,64 @@ fn frame_pixel(x: u32, y: u32, width: u32, height: u32, config: &Config) -> u32 
 mod tests {
     use super::*;
 
+    const SECOND_NS: i128 = 1_000_000_000;
+
     fn pixel(canvas: &[u8], width: u32, x: u32, y: u32) -> u32 {
         let start = ((y * width + x) * 4) as usize;
         u32::from_le_bytes(canvas[start..start + 4].try_into().unwrap())
     }
 
+    fn paint(
+        canvas: &mut [u8],
+        width: u32,
+        height: u32,
+        scale: u32,
+        config: &Config,
+        frame: Option<TimerFrame>,
+    ) {
+        paint_frames(
+            canvas,
+            width,
+            height,
+            scale,
+            config,
+            frame.into_iter().map(|frame| (config.timer.clone(), frame)),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn compiled_defaults_and_strict_parser() {
+    fn declarative_defaults_are_strict() {
         assert_eq!(Config::default(), parse_config(DEFAULT_CONFIG).unwrap());
-        let config = parse_config("border_color = \"#123AbC\"\nevent_line_thickness_px = 4\n[timer]\nedge = \"left\"\nstart = \"2px\"\nend = \"90%\"\nduration = \"1d\"\nanimation = \"flow-up\"\nfade = false\ncolor = \"#abcdef\"\n").unwrap();
+        let config = parse_config("border_color = \"#123AbC\"\n[timer]\nedge = \"left\"\nstart = \"2px\"\nend = \"90%\"\nduration = \"1d\"\nanimation = \"flow-up\"\ncolor = \"#abcdef\"\n").unwrap();
         assert_eq!(config.border_color, 0x123abc);
-        assert_eq!(config.timer.thickness_px, 4);
-        let fixed_range = parse_config("[timer]\nstart = \"20px\"\nend = \"30px\"").unwrap();
-        assert!(timer_bounds(fixed_range.timer, 10, 10).is_err());
+        assert_eq!(config.timer.animation, "flow-up");
+        assert!(timer_bounds(
+            TimerConfig {
+                start: Coordinate::Pixels(20),
+                end: Coordinate::Pixels(30),
+                ..config.timer.clone()
+            },
+            10,
+            10,
+            0,
+            3
+        )
+        .is_err());
         for invalid in [
             "border_color = #000000",
             "border_color = \"#00000g\"",
             "unknown = 1",
             "[other]",
-            "[highlight.default]\nedge = \"top\"", // incomplete
+            "[highlight.default]\nedge = \"top\"\nedge = \"bottom\"",
             "[timer]\nedge = \"bottom\"\nborder_color = \"#000000\"",
-            "[timer]\nstart = \"101%\"",
-            "[timer]\nstart = \"-1px\"",
-            "event_line_thickness_px = 2\n[timer]\nthickness_px = 3",
-            "border_thickness_px = 2\n[timer]\nthickness_px = 3",
-            "border_thickness_px = 2\nevent_line_thickness_px = 3",
+            "[timer]\nstart = \"201%\"",
             "[timer]\nduration = \"1d1s\"",
             "[timer]\nduration = \"0s\"",
-            "[timer]\nedge = \"top\"\nanimation = \"flow-up\"",
-            "[timer]\nfade = 1",
-            "[timer]\ncolor = \"#000000\"\ncolor = \"#ffffff\"",
+            "[timer]\nfade = true",
+            "fade_duration_ms = 1",
+            "[animation.expand]\npixels = \"missing\"",
+            "[pixel.solid]\nkeyframes = []",
         ] {
             assert!(parse_config(invalid).is_err(), "accepted {invalid:?}");
         }
@@ -954,17 +1282,13 @@ mod tests {
     #[test]
     fn config_creation_is_exact_read_only_when_missing_and_never_replaces() {
         let base = config_base();
-        let path = base.join("reEnvisioning/temporalShell/config.toml");
+        let path = base.join("temporalshell/config.toml");
         assert_eq!(load_at(&path).unwrap(), Config::default());
         assert!(!path.exists());
         assert_eq!(load_or_create_at(&path).unwrap(), Config::default());
         assert_eq!(fs::read(&path).unwrap(), DEFAULT_CONFIG.as_bytes());
         fs::write(&path, "border_color = \"#123456\"\n").unwrap();
         assert_eq!(load_or_create_at(&path).unwrap().border_color, 0x123456);
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "border_color = \"#123456\"\n"
-        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
@@ -986,47 +1310,60 @@ mod tests {
         use std::thread;
 
         let base = config_base();
-        let path = base.join("reEnvisioning/temporalShell/config.toml");
-        let left = path.clone();
-        let right = path.clone();
-        let one = thread::spawn(move || load_or_create_at(&left));
-        let two = thread::spawn(move || load_or_create_at(&right));
+        let path = base.join("temporalshell/config.toml");
+        let one = thread::spawn({
+            let path = path.clone();
+            move || load_or_create_at(&path)
+        });
+        let two = thread::spawn({
+            let path = path.clone();
+            move || load_or_create_at(&path)
+        });
         assert_eq!(one.join().unwrap().unwrap(), Config::default());
         assert_eq!(two.join().unwrap().unwrap(), Config::default());
         assert_eq!(fs::read(&path).unwrap(), DEFAULT_CONFIG.as_bytes());
         fs::remove_dir_all(base).unwrap();
 
         let base = config_base();
-        let path = base.join("reEnvisioning/temporalShell/config.toml");
+        let path = base.join("temporalshell/config.toml");
         private_directory(path.parent().unwrap()).unwrap();
         fs::create_dir(&path).unwrap();
         assert!(load_or_create_at(&path).is_err());
-        assert!(fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
-            !entry
+        assert!(fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".config.toml.")
-        }));
+                .starts_with(".config.toml.")));
         fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn parser_overlays_the_tracked_complete_defaults() {
-        let config = parse_config("border_color = \"#123456\"\n[timer]\nfade = false\n").unwrap();
+    fn parser_overlays_defaults_and_named_styles() {
+        let config = parse_config("border_color = \"#123456\"\n[timer]\ncolor = \"#abcdef\"\n[highlight.warm]\nedge = \"top\"\nanimation = \"static\"\ncolor = \"#ffffff\"\n").unwrap();
         assert_eq!(config.border_color, 0x123456);
-        assert!(!config.timer.fade);
-        assert_eq!(config.timer.edge, Config::default().timer.edge);
-        assert_eq!(Config::default(), parse_config(DEFAULT_CONFIG).unwrap());
+        assert_eq!(config.timer.color, 0xabcdef);
+        assert_eq!(config.named_style("warm").unwrap().edge, Edge::Top);
+        assert!(parse_config("[highlight.bad]\nanimation = \"missing\"\n").is_err());
+
+        let before = parse_config(
+            "[animation.expand]\ninterpolation = \"smooth\"\nkeyframes = [\"0:0\", \"100:100\"]\n",
+        )
+        .unwrap();
+        let after = parse_config(
+            "[animation.expand]\nkeyframes = [\"0:0\", \"100:100\"]\ninterpolation = \"smooth\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            before.animation("expand").unwrap().curve,
+            after.animation("expand").unwrap().curve
+        );
     }
 
     #[test]
-    fn named_styles_are_complete_and_newest_overlays() {
-        let config = parse_config(
-            "[timer]\nfade = false\n[highlight.warm]\nedge = \"top\"\nstart = \"0%\"\nend = \"100%\"\nthickness_px = 1\nduration = \"1s\"\nanimation = \"static\"\nfade = false\ncolor = \"#ffffff\"\n",
-        )
-        .unwrap();
-        assert!(parse_config("[highlight.bad]\nedge = \"top\"\n").is_err());
+    fn named_style_overlays_older_highlights() {
+        let config = parse_config("[timer]\nedge = \"top\"\nanimation = \"static\"\ncolor = \"#123456\"\n[highlight.warm]\nedge = \"top\"\nanimation = \"static\"\ncolor = \"#ffffff\"\n").unwrap();
         let active = [
             crate::timer::ActiveHighlight {
                 started_ns: 0,
@@ -1042,49 +1379,31 @@ mod tests {
             },
         ];
         let mut canvas = vec![0; 10 * 10 * 4];
-        paint_highlights(&mut canvas, 10, 10, 1, &config, &active, SECOND_NS).unwrap();
+        paint_highlights(&mut canvas, 10, 10, 1, &config, &active, SECOND_NS - 1).unwrap();
         assert_eq!(pixel(&canvas, 10, 5, 0), 0xffff_ffff);
-        paint_highlights(&mut canvas, 10, 10, 1, &config, &[], SECOND_NS).unwrap();
-        assert_eq!(pixel(&canvas, 10, 5, 0), 0xff00_0000);
     }
 
     #[test]
-    fn direct_trigger_style_is_complete_and_strict() {
-        let style = style_from_record(&[
-            "top", "0%", "100%", "1", "10s", "static", "false", "#ffffff",
-        ])
-        .unwrap();
-        assert_eq!(style.color, 0xffffff);
-        assert_eq!(
-            style_record(style),
-            "top\t0%\t100%\t1\t10s\tstatic\tfalse\t#ffffff"
+    fn trigger_records_name_animations() {
+        let style = style_from_record(&["top", "0%", "100%", "10s", "static", "#ffffff"]).unwrap();
+        assert_eq!(style_record(style), "top\t0%\t100%\t10s\tstatic\t#ffffff");
+        assert!(
+            style_from_record(&["top", "0%", "100%", "10s", "static", "false", "#ffffff"]).is_err()
         );
-        for fields in [
-            &["top", "0%", "100%", "1", "10s", "static", "false"][..],
-            &[
-                "top", "0%", "100%", "0", "10s", "static", "false", "#ffffff",
-            ][..],
-            &[
-                "top", "0%", "100%", "1", "10s", "flow-up", "false", "#ffffff",
-            ][..],
-            &["top", "0%", "100%", "1", "10s", "static", "false", "white"][..],
-        ] {
-            assert!(style_from_record(fields).is_err(), "accepted {fields:?}");
-        }
     }
 
     #[test]
-    fn raster_edges_coordinates_animations_and_color() {
+    fn raster_edges_coordinates_and_color() {
         let defaults = Config::default();
         let mut config = Config {
             border_color: 0x102030,
+            highlight_thickness_px: 2,
             timer: TimerConfig {
-                fade: false,
-                animation: Animation::Static,
                 start: Coordinate::Pixels(2),
                 end: Coordinate::Percent(80),
-                thickness_px: 2,
-                ..defaults.timer
+                animation: "static".into(),
+                color: 0xb8a890,
+                ..defaults.timer.clone()
             },
             ..defaults
         };
@@ -1096,7 +1415,7 @@ mod tests {
         for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
             config.timer.edge = edge;
             let mut canvas = vec![0; 10 * 10 * 4];
-            paint(&mut canvas, 10, 10, 1, &config, Some(frame)).unwrap();
+            paint(&mut canvas, 10, 10, 1, &config, Some(frame));
             assert_eq!(pixel(&canvas, 10, 0, 0), 0xff10_2030);
             match edge {
                 Edge::Top => assert_eq!(pixel(&canvas, 10, 2, 0), 0xffb8_a890),
@@ -1105,137 +1424,111 @@ mod tests {
                 Edge::Left => assert_eq!(pixel(&canvas, 10, 0, 7), 0xffb8_a890),
             }
         }
-        config.timer.start = Coordinate::Pixels(8);
-        config.timer.end = Coordinate::Pixels(2);
-        paint(&mut vec![0; 400], 10, 10, 1, &config, Some(frame)).unwrap();
     }
 
     #[test]
-    fn animation_masks_follow_local_coordinates_and_blink_at_two_hz() {
-        let defaults = Config::default().timer;
-        let bounds = timer_bounds(defaults, 10, 10).unwrap();
+    fn animation_masks_follow_local_coordinates_and_declarative_opacity() {
+        let config = Config::default();
         let frame = TimerFrame {
             started_ns: 0,
             deadline_ns: 10 * SECOND_NS,
             now_ns: 5 * SECOND_NS,
         };
-        let active = |animation, x, y, now_ns| {
+        let active = |animation: &str, y, now_ns| {
+            let style = TimerConfig {
+                edge: Edge::Left,
+                animation: animation.into(),
+                ..config.timer.clone()
+            };
             timer_pixel(
-                x,
+                0,
                 y,
-                TimerConfig {
-                    edge: Edge::Left,
-                    animation,
-                    fade: false,
-                    ..defaults
-                },
-                bounds,
+                &style,
+                timer_bounds(style.clone(), 10, 10, 0, config.highlight_thickness_px).unwrap(),
                 TimerFrame { now_ns, ..frame },
+                &config,
             )
             .is_some()
         };
-        assert!(active(Animation::FlowUp, 0, 9, frame.now_ns));
-        assert!(!active(Animation::FlowUp, 0, 0, frame.now_ns));
-        assert!(!active(Animation::FlowDown, 0, 9, frame.now_ns));
-        assert!(active(Animation::FlowDown, 0, 0, frame.now_ns));
-        assert!(!active(Animation::Expand, 0, 9, frame.now_ns));
-        assert!(active(Animation::Expand, 0, 5, frame.now_ns));
-        assert_eq!(
-            timer_pixel(
-                0,
-                9,
-                TimerConfig {
-                    edge: Edge::Left,
-                    animation: Animation::Blink,
-                    fade: true,
-                    ..defaults
-                },
-                bounds,
-                TimerFrame {
-                    now_ns: FADE_NS,
-                    ..frame
-                },
-            ),
-            Some(255)
-        );
-        assert_eq!(
-            timer_pixel(
-                0,
-                9,
-                TimerConfig {
-                    edge: Edge::Left,
-                    animation: Animation::Blink,
-                    fade: false,
-                    ..defaults
-                },
-                bounds,
-                TimerFrame {
-                    now_ns: FADE_NS,
-                    ..frame
-                },
-            ),
-            None
-        );
-        let flow = TimerConfig {
+        assert!(active("flow-up", 9, frame.now_ns));
+        assert!(!active("flow-up", 0, frame.now_ns));
+        assert!(!active("flow-down", 9, frame.now_ns));
+        assert!(active("flow-down", 1, frame.now_ns));
+        assert!(!active("expand", 9, frame.now_ns));
+        assert!(active("expand", 4, frame.now_ns));
+        let style = TimerConfig {
             edge: Edge::Left,
-            animation: Animation::FlowUp,
-            ..defaults
-        };
-        assert_eq!(
-            timer_pixel(
-                0,
-                6,
-                flow,
-                bounds,
-                TimerFrame {
-                    now_ns: 4_000_000_000,
-                    ..frame
-                },
-            ),
-            Some(0)
-        );
-        let fading = TimerConfig {
-            animation: Animation::Static,
-            fade: true,
-            ..defaults
+            animation: "flow-up".into(),
+            ..config.timer.clone()
         };
         assert_eq!(
             timer_pixel(
                 0,
                 9,
-                fading,
-                bounds,
+                &style,
+                timer_bounds(style.clone(), 10, 10, 0, config.highlight_thickness_px).unwrap(),
                 TimerFrame {
-                    now_ns: frame.deadline_ns - FADE_NS,
+                    now_ns: 4 * SECOND_NS,
                     ..frame
                 },
+                &config
             ),
             Some(255)
         );
-        assert_eq!(
-            timer_pixel(
-                0,
-                9,
-                fading,
-                bounds,
-                TimerFrame {
-                    now_ns: frame.deadline_ns - 1,
-                    ..frame
-                },
-            ),
-            Some(0)
-        );
+    }
+
+    #[test]
+    fn signed_overflow_follows_each_hard_and_rounded_corner_once() {
+        for radius in [0, 2] {
+            let config = Config {
+                corner_radius_px: radius,
+                ..Config::default()
+            };
+            for edge in [Edge::Top, Edge::Right, Edge::Bottom, Edge::Left] {
+                let style = TimerConfig {
+                    edge,
+                    start: Coordinate::Percent(-100),
+                    end: Coordinate::Percent(200),
+                    ..config.timer.clone()
+                };
+                assert!(timer_bounds(
+                    style,
+                    40,
+                    40,
+                    if radius == 0 {
+                        0
+                    } else {
+                        config.border_thickness_px + radius
+                    },
+                    config.highlight_thickness_px
+                )
+                .is_ok());
+            }
+        }
+        let config = Config::default();
+        assert!(timer_bounds(
+            TimerConfig {
+                start: Coordinate::Percent(-100),
+                end: Coordinate::Percent(300),
+                ..config.timer.clone()
+            },
+            20,
+            20,
+            0,
+            config.highlight_thickness_px
+        )
+        .is_err());
     }
 
     #[test]
     fn frame_scale_padding_and_buffer_cap() {
         let mut frame = vec![0; 40 * 40 * 4 + 7];
-        paint(&mut frame, 40, 40, 1, &Config::default(), None).unwrap();
+        paint(&mut frame, 40, 40, 1, &Config::default(), None);
         assert!(frame[6400..].iter().all(|byte| *byte == 0));
         assert_eq!(pixel(&frame, 40, 0, 0), 0xff00_0000);
         assert_eq!(pixel(&frame, 40, 20, 20), 0);
         let mut scaled = vec![0; 80 * 80 * 4];
-        paint(&mut scaled, 80, 80, 2, &Config::default(), None).unwrap();
+        paint(&mut scaled, 80, 80, 2, &Config::default(), None);
         for y in 0..40 {
             for x in 0..40 {
                 for scale_y in 0..2 {

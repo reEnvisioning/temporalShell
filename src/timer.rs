@@ -122,13 +122,13 @@ pub(crate) fn run(command: &crate::cli::TimerCommand) -> Result<String, Error> {
 }
 
 pub(crate) fn run_trigger(command: &crate::cli::TriggerCommand) -> Result<String, Error> {
+    let config = crate::core::Config::load().map_err(Error::Runtime)?;
     let style = match command {
         crate::cli::TriggerCommand::Named(name) => {
             validate_id(name).map_err(|_| {
                 Error::Input("NAME must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}".into())
             })?;
-            crate::core::Config::load()
-                .map_err(Error::Runtime)?
+            config
                 .named_style(name)
                 .ok_or_else(|| Error::Input(format!("trigger {name} is not configured")))?
         }
@@ -136,22 +136,33 @@ pub(crate) fn run_trigger(command: &crate::cli::TriggerCommand) -> Result<String
             edge,
             start,
             end,
-            thickness_px,
             duration,
             animation,
-            fade,
             color,
-        } => crate::core::style_from_record(&[
-            edge.as_str(),
-            start.as_str(),
-            end.as_str(),
-            thickness_px.as_str(),
-            duration.as_str(),
-            animation.as_str(),
-            fade.as_str(),
-            color.as_str(),
-        ])
-        .map_err(Error::Input)?,
+        } => {
+            let mut style = config.default_highlight();
+            for (key, value) in [
+                ("edge", edge.as_deref()),
+                ("start", start.as_deref()),
+                ("end", end.as_deref()),
+                ("duration", duration.as_deref()),
+                ("animation", animation.as_deref()),
+                ("color", color.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    crate::core::apply_trigger_option(&mut style, key, value)
+                        .map_err(Error::Input)?;
+                }
+            }
+            crate::core::validate_style(&style).map_err(Error::Input)?;
+            if !config.has_animation(&style.animation) {
+                return Err(Error::Input(format!(
+                    "trigger animation {} is not configured",
+                    style.animation
+                )));
+            }
+            style
+        }
     };
     let base = state_base().map_err(Error::Runtime)?;
     let shell = prepare_shell(&base).map_err(Error::Runtime)?;
@@ -176,8 +187,10 @@ pub(crate) fn snapshot_timers(
     snapshot_timers_at(&state_base()?, style, shell_started_ns)
 }
 
-pub(crate) fn snapshot_triggers() -> Result<Vec<ActiveHighlight>, String> {
-    snapshot_triggers_at(&state_base()?)
+pub(crate) fn snapshot_triggers(
+    config: &crate::core::Config,
+) -> Result<Vec<ActiveHighlight>, String> {
+    snapshot_triggers_at(&state_base()?, config)
 }
 
 fn snapshot_timers_at(
@@ -191,7 +204,7 @@ fn snapshot_timers_at(
     let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
     let mut active = timer_entries(&directory)?
         .into_iter()
-        .filter_map(|entry| timer_highlight(entry, style, shell_started_ns, now))
+        .filter_map(|entry| timer_highlight(entry, style.clone(), shell_started_ns, now))
         .collect::<Vec<_>>();
     sort_active(&mut active);
     Ok(active)
@@ -233,12 +246,26 @@ fn timer_highlight(
     })
 }
 
-fn snapshot_triggers_at(base: &Path) -> Result<Vec<ActiveHighlight>, String> {
+fn snapshot_triggers_at(
+    base: &Path,
+    config: &crate::core::Config,
+) -> Result<Vec<ActiveHighlight>, String> {
     let Some(directory) = snapshot_directory(base, "triggers")? else {
         return Ok(Vec::new());
     };
     let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    let mut active = trigger_entries(&directory)?
+    let entries = trigger_entries(&directory)?;
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| !config.has_animation(&entry.style.animation))
+    {
+        return Err(format!(
+            "{} references unknown animation {}",
+            directory.join(&entry.id).display(),
+            entry.style.animation
+        ));
+    }
+    let mut active = entries
         .into_iter()
         .filter_map(|entry| {
             let started = parse_timestamp(&entry.created).ok()?.unix_timestamp_nanos();
@@ -265,15 +292,9 @@ fn sort_active(active: &mut [ActiveHighlight]) {
 }
 
 fn snapshot_directory(base: &Path, kind: &str) -> Result<Option<PathBuf>, String> {
-    let owner = base.join("reEnvisioning");
-    let shell = owner.join("temporalShell");
+    let shell = base.join("temporalshell");
     let directory = shell.join(kind);
-    for (path, private) in [
-        (base, false),
-        (&owner, true),
-        (&shell, true),
-        (&directory, true),
-    ] {
+    for (path, private) in [(base, false), (&shell, true), (&directory, true)] {
         if readable_directory(path, private)?.is_none() {
             return Ok(None);
         }
@@ -337,9 +358,7 @@ fn prepare_shell(base: &Path) -> Result<PathBuf, String> {
         .create(base)
         .map_err(|error| format!("cannot create {}: {error}", base.display()))?;
     readable_directory(base, false)?.ok_or_else(|| format!("{} disappeared", base.display()))?;
-    let owner = base.join("reEnvisioning");
-    let shell = owner.join("temporalShell");
-    private_directory(&owner)?;
+    let shell = base.join("temporalshell");
     private_directory(&shell)?;
     Ok(shell)
 }
@@ -742,7 +761,7 @@ fn serialize_trigger(entry: &TriggerEntry) -> String {
     format!(
         "{}\t{}\n",
         entry.created,
-        crate::core::style_record(entry.style)
+        crate::core::style_record(entry.style.clone())
     )
 }
 
@@ -985,7 +1004,9 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
     static NUMBER: AtomicUsize = AtomicUsize::new(0);
+
     fn base() -> PathBuf {
         let path = env::temp_dir().join(format!(
             "temporalshell-state-{}",
@@ -1002,18 +1023,19 @@ mod tests {
     }
 
     #[test]
+    fn duration_is_strict() {
+        assert_eq!(parse_duration("1h2m").unwrap(), 3720);
+        assert!(parse_duration("2m1h").is_err());
+    }
+
+    #[test]
     fn records_preserve_legacy_normal_and_countdown() {
         let directory = base();
-        fs::write(directory.join("normal"), "2096-02-29T12:34:56Z\n").unwrap();
-        fs::write(
-            directory.join("countdown"),
+        write_record(&directory.join("normal"), "2096-02-29T12:34:56Z\n");
+        write_record(
+            &directory.join("countdown"),
             "2096-02-29T12:34:56Z\t2096-02-29T12:00:00Z\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        for path in [directory.join("normal"), directory.join("countdown")] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
         assert_eq!(
             list_timers(&directory).unwrap(),
             "countdown\t2096-02-29T12:34:56Z\nnormal\t2096-02-29T12:34:56Z\n"
@@ -1031,81 +1053,39 @@ mod tests {
         };
         let deadline = "2096-02-29T12:34:56Z";
         let deadline_ns = parse_date(deadline).unwrap().unix_timestamp_nanos();
+        let normal = || TimerEntry::Normal {
+            id: "n".into(),
+            deadline: deadline.into(),
+        };
+        assert!(
+            timer_highlight(normal(), style.clone(), deadline_ns - 1, deadline_ns - 1).is_none()
+        );
+        assert!(timer_highlight(normal(), style.clone(), deadline_ns - 1, deadline_ns).is_some());
+        assert!(timer_highlight(normal(), style.clone(), deadline_ns, deadline_ns).is_some());
+        assert!(
+            timer_highlight(normal(), style.clone(), deadline_ns + 1, deadline_ns + 1).is_none()
+        );
         assert!(timer_highlight(
-            TimerEntry::Normal {
-                id: "n".into(),
-                deadline: deadline.into()
-            },
-            style,
-            deadline_ns - 1,
-            deadline_ns - 1
-        )
-        .is_none());
-        assert!(timer_highlight(
-            TimerEntry::Normal {
-                id: "n".into(),
-                deadline: deadline.into()
-            },
-            style,
-            deadline_ns - 1,
-            deadline_ns
-        )
-        .is_some());
-        assert!(timer_highlight(
-            TimerEntry::Normal {
-                id: "n".into(),
-                deadline: deadline.into()
-            },
-            style,
-            deadline_ns,
-            deadline_ns
-        )
-        .is_some());
-        assert!(timer_highlight(
-            TimerEntry::Normal {
-                id: "n".into(),
-                deadline: deadline.into()
-            },
-            style,
-            deadline_ns + 1,
-            deadline_ns + 1
-        )
-        .is_none());
-        assert!(timer_highlight(
-            TimerEntry::Normal {
-                id: "n".into(),
-                deadline: deadline.into()
-            },
-            style,
+            normal(),
+            style.clone(),
             deadline_ns,
             deadline_ns + 10_000_000_000
         )
         .is_none());
         let created = "2096-02-29T12:34:46Z";
         let created_ns = parse_date(created).unwrap().unix_timestamp_nanos();
-        let countdown = timer_highlight(
-            TimerEntry::Countdown {
-                id: "c".into(),
-                deadline: deadline.into(),
-                created: created.into(),
-            },
-            style,
-            deadline_ns - 1,
-            deadline_ns - 1,
-        )
-        .unwrap();
-        assert_eq!(countdown.started_ns, created_ns);
-        assert!(timer_highlight(
-            TimerEntry::Countdown {
-                id: "c".into(),
-                deadline: deadline.into(),
-                created: created.into()
-            },
-            style,
-            deadline_ns + 1,
-            deadline_ns
-        )
-        .is_none());
+        let countdown = || TimerEntry::Countdown {
+            id: "c".into(),
+            deadline: deadline.into(),
+            created: created.into(),
+        };
+        assert_eq!(
+            timer_highlight(countdown(), style.clone(), deadline_ns - 1, deadline_ns - 1)
+                .unwrap()
+                .started_ns,
+            created_ns
+        );
+        assert!(timer_highlight(countdown(), style, deadline_ns + 1, deadline_ns).is_none());
     }
 
     #[test]
@@ -1121,8 +1101,10 @@ mod tests {
             &directory.join("countdown-new"),
             "2096-03-01T12:34:56Z\t2096-02-29T12:00:00Z\n",
         );
-        let now = parse_date("2096-02-29T12:34:56Z").unwrap();
-        assert_eq!(prune_timers_at(&directory, now).unwrap(), "");
+        assert_eq!(
+            prune_timers_at(&directory, parse_date("2096-02-29T12:34:56Z").unwrap()).unwrap(),
+            ""
+        );
         assert!(!directory.join("normal-old").exists());
         assert!(!directory.join("countdown-old").exists());
         assert!(directory.join("normal-new").exists());
@@ -1154,8 +1136,8 @@ mod tests {
             Some("new"),
             &TimerEntry::Normal {
                 id: String::new(),
-                deadline: "2096-02-29T12:34:56Z".into(),
-            },
+                deadline: "2096-02-29T12:34:56Z".into()
+            }
         )
         .is_err());
         assert_eq!(timer_entries(&directory).unwrap().len(), MAX_ENTRIES);
@@ -1170,14 +1152,14 @@ mod tests {
         let active = TriggerEntry {
             id: String::new(),
             created: canonical_timestamp(OffsetDateTime::now_utc()).unwrap(),
-            style,
+            style: style.clone(),
         };
         for id in ["expired-one", "expired-two"] {
             write_record(
                 &directory.join(id),
                 &format!(
                     "2000-01-01T00:00:00Z\t{}\n",
-                    crate::core::style_record(style)
+                    crate::core::style_record(style.clone())
                 ),
             );
         }
@@ -1197,32 +1179,50 @@ mod tests {
     }
 
     #[test]
+    fn trigger_snapshot_rejects_unknown_animation_without_deleting_state() {
+        let base = base();
+        let shell = prepare_shell(&base).unwrap();
+        let (_, triggers) = lock_directory(&shell, "triggers").unwrap();
+        let mut style = crate::core::Config::default().timer;
+        style.animation = "removed".into();
+        let path = triggers.join("unknown");
+        write_record(
+            &path,
+            &serialize_trigger(&TriggerEntry {
+                id: "unknown".into(),
+                created: canonical_timestamp(OffsetDateTime::now_utc()).unwrap(),
+                style,
+            }),
+        );
+        assert!(snapshot_triggers_at(&base, &crate::core::Config::default()).is_err());
+        assert!(path.exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn timer_and_trigger_snapshots_expire_independently() {
         let base = base();
         let shell = prepare_shell(&base).unwrap();
         let (_, timers) = lock_directory(&shell, "timers").unwrap();
         let (_, triggers) = lock_directory(&shell, "triggers").unwrap();
-        fs::write(timers.join("old"), "2000-01-01T00:00:00Z\n").unwrap();
-        fs::write(
-            triggers.join("old"),
-            format!(
+        write_record(&timers.join("old"), "2000-01-01T00:00:00Z\n");
+        write_record(
+            &triggers.join("old"),
+            &format!(
                 "2000-01-01T00:00:00Z\t{}\n",
                 crate::core::style_record(crate::core::Config::default().timer)
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        for path in [timers.join("old"), triggers.join("old")] {
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
         assert!(snapshot_timers_at(
             &base,
             crate::core::Config::default().timer,
-            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
         )
         .unwrap()
         .is_empty());
-        assert!(snapshot_triggers_at(&base).unwrap().is_empty());
+        assert!(snapshot_triggers_at(&base, &crate::core::Config::default())
+            .unwrap()
+            .is_empty());
         assert!(timers.join("old").exists());
         assert!(triggers.join("old").exists());
         fs::remove_dir_all(base).unwrap();

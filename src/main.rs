@@ -1,5 +1,6 @@
 use std::{env, process};
 
+mod animation;
 mod cli;
 mod core;
 #[cfg(target_os = "linux")]
@@ -16,7 +17,8 @@ fn main() {
         Ok(cli::Command::Help) => print!("{}", cli::help(&tool)),
         Ok(cli::Command::Timer(command)) => run_state(timer::run(&command), &tool),
         Ok(cli::Command::Trigger(command)) => run_state(timer::run_trigger(&command), &tool),
-        Ok(command) => run_platform(&command, &tool),
+        Ok(cli::Command::Shell) => run_shell(&tool),
+        Ok(cli::Command::Available) => run_available(),
         Err(error) => usage_error(&tool, error),
     }
 }
@@ -40,28 +42,28 @@ fn runtime_error(tool: &str, error: &str) -> ! {
 }
 
 #[cfg(target_os = "linux")]
-fn run_platform(command: &cli::Command, tool: &str) {
-    match linux::run(command) {
-        Ok(()) => {}
-        Err(linux::RunError::Shell(reason)) | Err(linux::RunError::Unavailable(reason)) => {
-            let prefix = if matches!(command, cli::Command::Available) {
-                "unavailable"
-            } else {
-                tool
-            };
-            eprintln!("{prefix}: {reason}");
-            process::exit(1);
-        }
+fn run_shell(tool: &str) {
+    if let Err(error) = linux::shell() {
+        runtime_error(tool, &error);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_available() {
+    if let Err(error) = linux::available_command() {
+        eprintln!("unavailable: {error}");
+        process::exit(1);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_platform(command: &cli::Command, _: &str) {
-    let action = if matches!(command, cli::Command::Available) {
-        "available"
-    } else {
-        "run"
-    };
-    eprintln!("unavailable: temporalshell requires Linux Wayland ({action})");
+fn run_shell(_: &str) {
+    eprintln!("unavailable: temporalshell requires Linux Wayland (run)");
+    process::exit(1);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_available() {
+    eprintln!("unavailable: temporalshell requires Linux Wayland (available)");
     process::exit(1);
 }

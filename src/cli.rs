@@ -12,7 +12,7 @@ Commands:
   timer remove --date DATE             remove timers by deadline
   timer reset                          remove every timer
   trigger NAME                         run a named TOML highlight
-  trigger [HIGHLIGHT OPTIONS]          run a complete direct highlight
+  trigger [HIGHLIGHT OPTIONS]          run a direct highlight over configured defaults
 
 Options:
       --date DATE
@@ -24,12 +24,10 @@ Options:
       --edge top|right|bottom|left
       --start BOUND
       --end BOUND
-      --thickness-px N
       --duration DURATION
-      --animation expand|flow-up|flow-down|static|blink
-      --fade true|false
+      --animation NAME
       --color #RRGGBB
-             direct highlight options; all are required in the displayed order
+             direct highlight options; any subset may be supplied in any order
       --help
              display this help and exit
 "#;
@@ -57,14 +55,12 @@ pub(crate) enum TimerCommand {
 pub(crate) enum TriggerCommand {
     Named(String),
     Direct {
-        edge: String,
-        start: String,
-        end: String,
-        thickness_px: String,
-        duration: String,
-        animation: String,
-        fade: String,
-        color: String,
+        edge: Option<String>,
+        start: Option<String>,
+        end: Option<String>,
+        duration: Option<String>,
+        animation: Option<String>,
+        color: Option<String>,
     },
 }
 
@@ -87,6 +83,38 @@ fn id_option(args: &[String]) -> Result<Option<String>, &'static str> {
         [flag, id] if flag == "--id" => Ok(Some(id.clone())),
         _ => Err("invalid command"),
     }
+}
+
+fn trigger_options(args: &[String]) -> Result<TriggerCommand, &'static str> {
+    let (mut edge, mut start, mut end, mut duration, mut animation, mut color) =
+        (None, None, None, None, None, None);
+    let mut pairs = args.chunks_exact(2);
+    for pair in &mut pairs {
+        let target = match pair[0].as_str() {
+            "--edge" => &mut edge,
+            "--start" => &mut start,
+            "--end" => &mut end,
+            "--duration" => &mut duration,
+            "--animation" => &mut animation,
+            "--color" => &mut color,
+            _ => return Err("unknown trigger option"),
+        };
+        if target.is_some() {
+            return Err("duplicate trigger option");
+        }
+        *target = Some(pair[1].clone());
+    }
+    if !pairs.remainder().is_empty() {
+        return Err("trigger option requires a value");
+    }
+    Ok(TriggerCommand::Direct {
+        edge,
+        start,
+        end,
+        duration,
+        animation,
+        color,
+    })
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Command, &'static str> {
@@ -156,27 +184,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Command, &'static str> {
         [trigger, name] if trigger == "trigger" && !name.starts_with('-') => {
             Ok(Command::Trigger(TriggerCommand::Named(name.clone())))
         }
-        [trigger, edge_flag, edge, start_flag, start, end_flag, end, thickness_flag, thickness_px, duration_flag, duration, animation_flag, animation, fade_flag, fade, color_flag, color]
-            if trigger == "trigger"
-                && edge_flag == "--edge"
-                && start_flag == "--start"
-                && end_flag == "--end"
-                && thickness_flag == "--thickness-px"
-                && duration_flag == "--duration"
-                && animation_flag == "--animation"
-                && fade_flag == "--fade"
-                && color_flag == "--color" =>
-        {
-            Ok(Command::Trigger(TriggerCommand::Direct {
-                edge: edge.clone(),
-                start: start.clone(),
-                end: end.clone(),
-                thickness_px: thickness_px.clone(),
-                duration: duration.clone(),
-                animation: animation.clone(),
-                fade: fade.clone(),
-                color: color.clone(),
-            }))
+        [trigger, options @ ..] if trigger == "trigger" => {
+            Ok(Command::Trigger(trigger_options(options)?))
         }
         _ => Err("invalid command"),
     }
@@ -238,27 +247,24 @@ mod tests {
             Ok(Command::Trigger(TriggerCommand::Named(_)))
         ));
         assert!(matches!(
+            parse(&args(&["trigger"])),
+            Ok(Command::Trigger(TriggerCommand::Direct { .. }))
+        ));
+        assert!(matches!(
             parse(&args(&[
                 "trigger",
-                "--edge",
-                "top",
-                "--start",
-                "0%",
-                "--end",
-                "100%",
-                "--thickness-px",
-                "1",
                 "--duration",
-                "1s",
-                "--animation",
-                "static",
-                "--fade",
-                "false",
+                "2s",
                 "--color",
                 "#ffffff"
             ])),
             Ok(Command::Trigger(TriggerCommand::Direct { .. }))
         ));
+        assert!(matches!(
+            parse(&args(&["trigger", "--start", "0%", "--edge", "top"])),
+            Ok(Command::Trigger(TriggerCommand::Direct { .. }))
+        ));
+        assert!(parse(&args(&["trigger", "--fade", "false"])).is_err());
         for invalid in [
             &["help"][..],
             &["--help", "extra"][..],
@@ -266,7 +272,9 @@ mod tests {
             &["timer", "prune", "now"][..],
             &["timer", "add", "10s", "--highlight", "x"][..],
             &["trigger", "warm", "--id", "x"][..],
-            &["trigger", "--start", "0%", "--edge", "top"][..],
+            &["trigger", "--edge"][..],
+            &["trigger", "--thickness-px", "1"][..],
+            &["trigger", "--color", "#fff", "--color", "#ffffff"][..],
         ] {
             assert!(parse(&args(invalid)).is_err(), "accepted {invalid:?}");
         }

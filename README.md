@@ -1,48 +1,63 @@
 # temporalShell
 
-A passive border and timer line for Wayland compositors with `wlr-layer-shell`.
+A passive Wayland border with declarative timer and trigger highlights.
 
-## Install
+## Install and use
 
 ```sh
 cargo install --git https://github.com/reEnvisioning/temporalShell.git
 nix run github:reEnvisioning/temporalShell -- available
 ```
 
-```nix
-inputs.temporalshell.url = "github:reEnvisioning/temporalShell";
-packages.${pkgs.system}.default = inputs.temporalshell.packages.${pkgs.system}.default;
-```
-
-## Use
-
 ```sh
 temporalshell
-temporalshell timer add --date 2096-02-29T12:34:56Z --id meeting
+temporalshell available
 temporalshell timer add 10m --countdown
-temporalshell trigger warning
-temporalshell trigger --edge top --start 0% --end 100% --thickness-px 1 --duration 10s --animation static --fade false --color '#ffffff'
-temporalshell timer list
+temporalshell trigger --edge top --animation static --color '#ffffff'
 ```
 
-Only the lowercase `temporalshell` command is installed. `available`, timer commands, and trigger commands never create config or require Wayland. Run `temporalshell --help` for the exact command reference.
-
-The shell runs in the foreground without systemd and uses one input-empty, non-exclusive full-output surface and up to two retained ARGB buffers per output. It follows output hotplug and integer buffer-scale changes; a style that cannot fit one output is skipped there without affecting other styles or outputs. Buffers above 64 MiB are rejected. Drawing requires Linux and a compositor advertising `wlr-layer-shell`; there is no X11 or fractional-scale protocol support.
+`available`, timer commands, and trigger commands require no Wayland surface. The shell is foreground-only, input-empty, non-exclusive, Linux-only, and needs a compositor advertising `wlr-layer-shell`.
 
 ## Config
 
-The canonical defaults are tracked in [`default.toml`](default.toml) and embedded in the binary. On the first normal shell launch only, an absent `${XDG_CONFIG_HOME:-$HOME/.config}/reEnvisioning/temporalShell/config.toml` is created from those exact bytes. Package installation, management commands, and reloads never create it.
+The embedded [`default.toml`](default.toml) is created only by a first normal shell launch at `${XDG_CONFIG_HOME:-$HOME/.config}/temporalshell/config.toml`. Unknown and duplicate keys are rejected. Highlights contain only geometry, lifetime, animation name, and color:
 
-The parser rejects unknown or duplicate keys and tables. Root keys must precede `[timer]`. The old root `event_line_thickness_px` key is an alias for `timer.thickness_px`; setting both is an error. Colors must be quoted `"#RRGGBB"`. Border and timer pixels are opaque; the existing inward shadow remains controlled by `shadow_strength_percent` (0–100) and `shadow_color`. Border thickness is 1–256px, corner radius is 0–256px, and timer thickness is 1–256px but must not exceed border thickness.
+```toml
+[highlight.warning]
+edge = "top"
+start = "0%"
+end = "100%"
+duration = "2s"
+animation = "blink"
+color = "#FF0000"
+```
 
-Timer edges are `top`, `right`, `bottom`, or `left`. Bounds are quoted nonnegative integer `N%` (0–100) or `Npx`; units may be mixed, but resolved bounds must remain within the edge and satisfy start < end. Percent bounds use integer floor against the full edge length. Horizontal coordinates run left to right. Vertical coordinates run from screen bottom to top.
+Every animation is configured under `[animation.NAME]`; names have no built-in behavior. The tracked defaults define `expand`, `flow-up`, `flow-down`, `static`, and `blink`. An animation selects a named `[pixel.NAME]` behavior and may provide keyframes, interpolation, an expression, and a spatial mask:
 
-`duration` uses positive descending `d`, `h`, `m`, and `s` components and is capped at `1d`. `expand` grows from the center to both endpoints. `flow-up` and `flow-down` require left/right edges. `static` shows the full range. `blink` alternates the full range at 2Hz.
+```toml
+[animation.spring]
+pixels = "fade"
+keyframes = ["0:0", "55:115", "72:94", "86:103", "100:100"]
+interpolation = "smooth"
+expression = "keyframe + 0.03 * sin(phase * 30)"
+mask = "keyframe - position"
+```
 
-`[timer]` is the timer style. Named `[highlight.NAME]` tables must contain all eight timer keys (`edge`, `start`, `end`, `thickness_px`, `duration`, `animation`, `fade`, and `color`); `[highlight.default]` is invalid. `trigger NAME` copies the named style into private trigger state, so later config changes do not alter that trigger. The direct trigger flags copy the same complete style. Active timers and triggers are sorted by start then ID and painted old to new; newer pixels overlay older ones.
+Keyframes are `time:factor` decimal percentages. Times must increase from 0 through 100; factors may overshoot. Interpolation is `linear`, `smooth`, or `step`. Without keyframes, `keyframe` is 1. With both keyframes and an expression, the expression transforms the interpolated value.
 
-## State
+Expressions support finite numbers, parentheses, unary `-`, `+ - * / %`, and `abs`, `min`, `max`, `clamp`, `lerp`, `step`, `smoothstep`, `floor`, `ceil`, `round`, `fract`, `sin`, `cos`, `tan`, `exp`, `log`, `pow`, and `sqrt`. Available values are `phase`, `keyframe`, `from`, `to`, `value`, `elapsed`, `remaining`, `duration`, `position`, `pixel`, `coverage`, `pi`, and `e`. Invalid or non-finite operations become zero rather than entering the raster.
 
-`timer add DURATION [--id ID]` and `timer add --date DATE [--id ID]` hide until their deadline, then use `[timer]` for its configured duration. A normal timer whose deadline predates a shell start never appears in that shell; deadlines after startup can use the full duration. Add `--countdown` immediately after the duration or date to animate from creation through the deadline instead. Both expire; no timer highlight flag exists. `timer prune` silently removes expired normal and countdown records. Add and list print `ID<TAB>DATE`; remove and reset remain silent. Legacy one-line `DATE\n` records remain normal timers.
+Pixel behavior is independent from movement. The default fade is itself TOML rather than Rust policy:
 
-`trigger NAME` uses a named style. The only direct form is `trigger --edge EDGE --start BOUND --end BOUND --thickness-px N --duration DURATION --animation ANIMATION --fade BOOL --color COLOR`; all flags are required in that order. Names are case-sensitive ASCII `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; automatic IDs are eight lowercase alphanumeric characters. Trigger state is independent under `${XDG_STATE_HOME:-$HOME/.local/state}/reEnvisioning/temporalShell/triggers/`; timer state remains under `timers/`. Management uses private files, atomic publication, and separate private locks. Renderer snapshots are read-only and bounded; absent state creates no directories or locks. Malformed names, state, permissions, symlinks, special files, oversized entries, and more than 4096 directory entries are rejected.
+```toml
+[pixel.fade]
+expression = "coverage * min(1, min(elapsed, remaining) / 0.25)"
+```
+
+Expressions compile when config loads. The renderer performs no parsing while drawing. The 64 KiB complete config bound is the aggregate animation/keyframe bound; there is no separate animation or keyframe-count policy.
+
+The evaluator can carry `from` and `to` separately from the movement factor, but current timers and triggers supply `0` and `1`. A future dynamic source could initialize its first observation with `from == to`, so 40 appears immediately, then evaluate `40 + (45 - 40) * keyframe` for a change to 45. Audio and meter commands are not implemented.
+
+`trigger [--edge EDGE] [--start BOUND] [--end BOUND] [--duration DURATION] [--animation NAME] [--color COLOR]` inherits `[highlight.default]`. The former `fade`, `fade_duration_ms`, `blink_interval_ms`, fixed animation enum, and old trigger record format are intentionally unsupported. Existing config and trigger state are never rewritten or deleted automatically.
+
+State remains private and atomic under `${XDG_STATE_HOME:-$HOME/.local/state}/temporalshell/`; malformed, oversized, unsafe, and old-format records are rejected.

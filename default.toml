@@ -1,5 +1,8 @@
 border_thickness_px = 10
+highlight_thickness_px = 3
 corner_radius_px = 0
+shadow_width_px = 3
+shadow_peak_opacity_percent = 30
 shadow_strength_percent = 35
 shadow_color = "#B8A890"
 border_color = "#000000"
@@ -8,8 +11,45 @@ border_color = "#000000"
 edge = "bottom"
 start = "0%"
 end = "100%"
-thickness_px = 3
 duration = "10s"
 animation = "expand"
-fade = true
 color = "#B8A890"
+
+[highlight.default]
+edge = "bottom"
+start = "0%"
+end = "100%"
+duration = "5s"
+animation = "expand"
+color = "#FFFFFF"
+
+[animation.expand]
+pixels = "fade"
+keyframes = ["0:0", "100:100"]
+mask = "keyframe - abs(position + position - 1)"
+
+[animation.flow-up]
+pixels = "fade"
+keyframes = ["0:0", "100:100"]
+mask = "keyframe - position"
+
+[animation.flow-down]
+pixels = "fade"
+keyframes = ["0:0", "100:100"]
+mask = "keyframe - (1 - position)"
+
+[animation.static]
+pixels = "solid"
+
+[animation.blink]
+pixels = "blink"
+keyframes = ["0:0", "100:100"]
+
+[pixel.solid]
+keyframes = ["0:100"]
+
+[pixel.fade]
+expression = "coverage * min(1, min(elapsed, remaining) / 0.25)"
+
+[pixel.blink]
+expression = "coverage * (1 - step(0.5, fract(elapsed / 0.5)))"

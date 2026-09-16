@@ -34,13 +34,11 @@ use wayland_client::{
 };
 
 use crate::{
-    core::{buffer_dimensions, paint_highlights, Animation, Config, TimerFrame},
+    core::{buffer_dimensions, paint_highlights, Config, TimerFrame},
     timer::ActiveHighlight,
 };
 
 const RELOAD_INTERVAL: Duration = Duration::from_millis(250);
-const BLINK_INTERVAL_NS: i128 = 250_000_000;
-const FADE_NS: i128 = 250_000_000;
 const BUFFER_RETRY: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,21 +128,6 @@ struct App {
     visual_key: Option<Vec<(i128, String)>>,
 }
 
-pub(crate) enum RunError {
-    Shell(String),
-    Unavailable(String),
-}
-
-pub(crate) fn run(command: &crate::cli::Command) -> Result<(), RunError> {
-    match command {
-        crate::cli::Command::Shell => shell().map_err(RunError::Shell),
-        crate::cli::Command::Available => available_command().map_err(RunError::Unavailable),
-        crate::cli::Command::Help
-        | crate::cli::Command::Timer(_)
-        | crate::cli::Command::Trigger(_) => Ok(()),
-    }
-}
-
 fn initialize(
     config: Config,
     shell_started_ns: i128,
@@ -188,7 +171,7 @@ fn initialize(
     ))
 }
 
-fn available_command() -> Result<(), String> {
+pub(crate) fn available_command() -> Result<(), String> {
     let (_, app) = initialize(Config::default(), 0, Vec::new(), Vec::new())?;
     if app.output_state.outputs().next().is_none() {
         return Err("no Wayland outputs available".into());
@@ -197,15 +180,16 @@ fn available_command() -> Result<(), String> {
     Ok(())
 }
 
-fn shell() -> Result<(), String> {
+pub(crate) fn shell() -> Result<(), String> {
     let shell_started_ns = OffsetDateTime::now_utc().unix_timestamp_nanos();
     let config = Config::load_or_create()?;
-    let timer_highlights = crate::timer::snapshot_timers(config.timer, shell_started_ns)?;
+    let timer_highlights = crate::timer::snapshot_timers(config.timer.clone(), shell_started_ns)?;
+    let trigger_highlights = crate::timer::snapshot_triggers(&config)?;
     let (mut queue, mut app) = initialize(
         config,
         shell_started_ns,
         timer_highlights,
-        crate::timer::snapshot_triggers()?,
+        trigger_highlights,
     )?;
     loop {
         queue
@@ -348,10 +332,13 @@ impl App {
         self.render_diagnostic = None;
         let now_ns = OffsetDateTime::now_utc().unix_timestamp_nanos();
         let animate = highlights.iter().any(|highlight| {
-            let timer = highlight.style.unwrap_or(self.config.timer);
+            let timer = highlight
+                .style
+                .clone()
+                .unwrap_or_else(|| self.config.timer.clone());
             needs_frame_callback(
-                timer.animation,
-                timer.fade,
+                &self.config,
+                &timer,
                 TimerFrame {
                     started_ns: highlight.started_ns,
                     deadline_ns: highlight.expires_ns,
@@ -493,7 +480,7 @@ impl App {
             }
             Err(error) => diagnose_once(&mut self.config_diagnostic, error),
         }
-        match crate::timer::snapshot_timers(self.config.timer, self.shell_started_ns) {
+        match crate::timer::snapshot_timers(self.config.timer.clone(), self.shell_started_ns) {
             Ok(highlights) => {
                 self.timer_diagnostic = None;
                 if highlights != self.timer_highlights {
@@ -503,7 +490,7 @@ impl App {
             }
             Err(error) => diagnose_once(&mut self.timer_diagnostic, error),
         }
-        match crate::timer::snapshot_triggers() {
+        match crate::timer::snapshot_triggers(&self.config) {
             Ok(highlights) => {
                 self.trigger_diagnostic = None;
                 if highlights != self.trigger_highlights {
@@ -521,16 +508,7 @@ impl App {
             self.active_highlights()
                 .into_iter()
                 .filter(|highlight| now < highlight.expires_ns)
-                .map(|highlight| {
-                    let timer = highlight.style.unwrap_or(self.config.timer);
-                    let phase = match timer.animation {
-                        Animation::Blink => (now - highlight.started_ns) / BLINK_INTERVAL_NS,
-                        _ if timer.fade && now - highlight.started_ns < FADE_NS => 0,
-                        _ if timer.fade && highlight.expires_ns - now <= FADE_NS => 2,
-                        _ => 1,
-                    };
-                    (highlight.started_ns, format!("{}:{phase}", highlight.id))
-                })
+                .map(|highlight| (highlight.started_ns, highlight.id))
                 .collect(),
         );
         if key != self.visual_key {
@@ -553,31 +531,10 @@ impl App {
     }
 
     fn visual_timeout(&self) -> Option<Duration> {
-        let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
-        self.active_highlights()
-            .into_iter()
-            .filter_map(|highlight| {
-                let timer = highlight.style.unwrap_or(self.config.timer);
-                let elapsed = now - highlight.started_ns;
-                let remaining = highlight.expires_ns - now;
-                let animation_delay = match timer.animation {
-                    Animation::Blink => {
-                        Some(BLINK_INTERVAL_NS - elapsed.rem_euclid(BLINK_INTERVAL_NS))
-                    }
-                    _ if timer.fade && elapsed < FADE_NS => Some(FADE_NS - elapsed),
-                    _ if timer.fade && remaining > FADE_NS => Some(remaining - FADE_NS),
-                    _ => None,
-                };
-                [
-                    highlight.expires_ns - now,
-                    animation_delay.unwrap_or(i128::MAX),
-                ]
-                .into_iter()
-                .filter(|delay| *delay > 0)
-                .min()
-                .map(|delay| Duration::from_nanos(u64::try_from(delay).unwrap_or(u64::MAX)))
-            })
-            .min()
+        next_expiry_timeout(
+            &self.active_highlights(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+        )
     }
 
     fn remove_output_for_layer(&mut self, layer: &LayerSurface) {
@@ -591,20 +548,22 @@ fn retry_timeout(retry_at: Instant, now: Instant) -> Duration {
     retry_at.saturating_duration_since(now)
 }
 
-fn needs_frame_callback(animation: Animation, fade: bool, frame: TimerFrame) -> bool {
-    let elapsed = frame.now_ns - frame.started_ns;
-    let remaining = frame.deadline_ns - frame.now_ns;
-    if remaining <= 0 {
-        return false;
-    }
-    matches!(
-        animation,
-        Animation::Expand | Animation::FlowUp | Animation::FlowDown
-    ) && elapsed < frame.deadline_ns - frame.started_ns
-        || fade
-            && (matches!(animation, Animation::Blink)
-                || elapsed < FADE_NS
-                || 0 < remaining && remaining <= FADE_NS)
+fn next_expiry_timeout(highlights: &[ActiveHighlight], now_ns: i128) -> Option<Duration> {
+    highlights
+        .iter()
+        .filter_map(|highlight| {
+            let delay = highlight.expires_ns - now_ns;
+            (delay > 0).then(|| Duration::from_nanos(u64::try_from(delay).unwrap_or(u64::MAX)))
+        })
+        .min()
+}
+
+fn needs_frame_callback(
+    config: &Config,
+    style: &crate::core::TimerConfig,
+    frame: TimerFrame,
+) -> bool {
+    frame.now_ns < frame.deadline_ns && config.animation_changes(style)
 }
 
 fn diagnose_once(previous: &mut Option<String>, error: String) {
@@ -807,35 +766,31 @@ mod tests {
     }
 
     #[test]
-    fn idle_static_and_non_fading_blink_do_not_request_frames() {
+    fn static_expiry_gets_an_exact_wakeup() {
+        let highlight = ActiveHighlight {
+            started_ns: 0,
+            expires_ns: 1_000_000_000,
+            id: "static".into(),
+            style: None,
+        };
+        assert_eq!(
+            next_expiry_timeout(std::slice::from_ref(&highlight), 750_000_000),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(next_expiry_timeout(&[highlight], 1_000_000_000), None);
+    }
+
+    #[test]
+    fn static_sleeps_and_expand_changes() {
+        let config = Config::default();
         let frame = TimerFrame {
             started_ns: 0,
-            deadline_ns: 10_000_000_000,
-            now_ns: 5_000_000_000,
+            deadline_ns: 10,
+            now_ns: 5,
         };
-        assert!(!needs_frame_callback(Animation::Static, false, frame));
-        assert!(!needs_frame_callback(Animation::Blink, false, frame));
-        assert!(needs_frame_callback(Animation::Expand, false, frame));
-        assert!(needs_frame_callback(
-            Animation::Static,
-            true,
-            TimerFrame { now_ns: 1, ..frame }
-        ));
-        assert!(needs_frame_callback(
-            Animation::Static,
-            true,
-            TimerFrame {
-                now_ns: frame.deadline_ns - 1,
-                ..frame
-            }
-        ));
-        assert!(!needs_frame_callback(
-            Animation::Blink,
-            true,
-            TimerFrame {
-                now_ns: frame.deadline_ns,
-                ..frame
-            }
-        ));
+        let mut style = config.timer.clone();
+        style.animation = "static".into();
+        assert!(!needs_frame_callback(&config, &style, frame));
+        assert!(needs_frame_callback(&config, &config.timer, frame));
     }
 }
