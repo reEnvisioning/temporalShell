@@ -959,20 +959,31 @@ fn timer_bounds(
             true,
         ),
     };
+    let edge_start = -arc.div_euclid(2);
+    let edge_span = own + arc;
+    let edge_end = edge_start + edge_span;
+    let adjacent = neighbor + arc;
     let resolve = |coordinate| match coordinate {
         Coordinate::Percent(value) if value < 0 => {
-            -arc - (neighbor * i64::from(-value)).div_euclid(100)
+            edge_start - (adjacent * i64::from(-value)).div_euclid(100)
         }
         Coordinate::Percent(value) if value > 100 => {
-            own + arc + (neighbor * i64::from(value - 100)).div_euclid(100)
+            edge_end + (adjacent * i64::from(value - 100)).div_euclid(100)
         }
-        Coordinate::Percent(value) => (own * i64::from(value)).div_euclid(100),
+        Coordinate::Percent(value) => edge_start + (edge_span * i64::from(value)).div_euclid(100),
         Coordinate::Pixels(value) => i64::from(value),
     };
     let start = resolve(timer.start);
     let end = resolve(timer.end);
-    let adjacent = neighbor + arc;
-    if start >= end || start < -adjacent || end > own + adjacent {
+    let start_limit = match timer.start {
+        Coordinate::Percent(_) => edge_start - adjacent,
+        Coordinate::Pixels(_) => -adjacent,
+    };
+    let end_limit = match timer.end {
+        Coordinate::Percent(_) => edge_end + adjacent,
+        Coordinate::Pixels(_) => own + adjacent,
+    };
+    if start >= end || start < start_limit || end > end_limit {
         return Err(
             "highlight bounds must satisfy start < end and wrap at most one adjacent edge".into(),
         );
@@ -1475,6 +1486,81 @@ mod tests {
             ),
             Some(255)
         );
+    }
+
+    #[test]
+    fn rounded_percentage_midpoints_cover_each_edge_and_limit_overflow() {
+        for (edge, own, neighbor) in [
+            (Edge::Top, 36, 26),
+            (Edge::Right, 26, 36),
+            (Edge::Bottom, 36, 26),
+            (Edge::Left, 26, 36),
+        ] {
+            let rounded = TimerConfig {
+                edge,
+                start: Coordinate::Percent(0),
+                end: Coordinate::Percent(100),
+                ..Config::default().timer
+            };
+            let bounds = timer_bounds(rounded.clone(), 50, 40, 7, 7).unwrap();
+            let arc = 11;
+            let edge_start = -arc / 2;
+            let edge_end = edge_start + own + arc;
+            assert_eq!((bounds.start, bounds.end), (edge_start, edge_end));
+
+            let overflow = timer_bounds(
+                TimerConfig {
+                    start: Coordinate::Percent(-100),
+                    end: Coordinate::Percent(200),
+                    ..rounded.clone()
+                },
+                50,
+                40,
+                7,
+                7,
+            )
+            .unwrap();
+            assert_eq!(
+                (overflow.start, overflow.end),
+                (edge_start - neighbor - arc, edge_end + neighbor + arc)
+            );
+            assert!(timer_bounds(
+                TimerConfig {
+                    end: Coordinate::Percent(203),
+                    ..rounded.clone()
+                },
+                50,
+                40,
+                7,
+                7,
+            )
+            .is_err());
+
+            let hard = timer_bounds(rounded, 50, 40, 0, 7).unwrap();
+            let hard_own = match edge {
+                Edge::Top | Edge::Bottom => 50,
+                Edge::Right | Edge::Left => 40,
+            };
+            assert_eq!((hard.start, hard.end), (0, hard_own));
+        }
+
+        for (start, end, valid) in [(-37, 73, true), (-38, 73, false), (-37, 74, false)] {
+            assert_eq!(
+                timer_bounds(
+                    TimerConfig {
+                        start: Coordinate::Pixels(start),
+                        end: Coordinate::Pixels(end),
+                        ..Config::default().timer
+                    },
+                    50,
+                    40,
+                    7,
+                    7
+                )
+                .is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]

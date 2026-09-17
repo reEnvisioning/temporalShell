@@ -32,6 +32,8 @@ animation = "blink"
 color = "#FF0000"
 ```
 
+Rounded percentage bounds run from one corner-arc midpoint to the next; signed percentage overflow reaches at most the neighboring edge, while pixel bounds retain their tangent-to-tangent edge-relative offsets.
+
 Every animation is configured under `[animation.NAME]`; names have no built-in behavior. The tracked defaults define `expand`, `flow-up`, `flow-down`, `static`, and `blink`. An animation selects a named `[pixel.NAME]` behavior and may provide keyframes, interpolation, an expression, and a spatial mask:
 
 ```toml
